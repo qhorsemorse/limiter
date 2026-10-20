@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Control Limits</title>
+<style>
+  :root{color-scheme:light}
+  body{font-family:system-ui,sans-serif;margin:0;padding:24px;background:#f4f6fb;color:#1b1b1b}
+  h1{font-size:22px;margin:0 0 4px}
+  .sub{color:#666;margin:0 0 20px;font-size:13px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:16px}
+  .card{background:#fff;border:1px solid #e0e0e0;border-radius:10px;padding:16px;box-shadow:0 1px 3px rgba(0,0,0,.05)}
+  .card h2{margin:0 0 2px;font-size:16px}
+  .tag{display:inline-block;font-size:11px;padding:2px 8px;border-radius:10px;margin-left:8px;vertical-align:middle}
+  .t-abs{background:#ffecec;color:#c42}
+  .t-time{background:#e6f0fc;color:#269}
+  .doms{color:#444;font-size:13px;margin:8px 0;word-break:break-word}
+  .state{font-weight:600}
+  .st-blocked{color:#c42}
+  .st-free{color:#2a8}
+  .count{font-family:mono;font-size:20px;margin:6px 0}
+  .lim{color:#777;font-size:12px}
+  form{background:#fff;border:1px solid #e0e0e0;border-radius:10px;padding:18px;margin-bottom:20px;max-width:420px}
+  label{display:block;font-size:13px;margin:10px 0 3px;color:#333}
+  input,select{width:100%;padding:7px;border:1px solid #ccc;border-radius:6px box-sizing:border-box}
+  button{margin-top:14px;padding:9px 16px;background:#2b6289;color:#fff;border:none;border-radius:6px;cursor:pointer}
+  .err{color:#c42;margin-top:8px;font-size:13px;min-height:16px}
+  .ok{color:#2a8;margin-top:8px;font-size:13px;min-height:16px}
+  .topnav{max-width:540px;margin:0 0 18px;padding:6px;background:#fff;
+         border:1px solid #e0e0e0;border-radius:10px;box-shadow:0 1px 3px rgba(0,0,0,.05);
+         display:flex;gap:16px}
+  .topnav a{padding:8px 16px;border-radius:6px;text-decoration:none;font-weight:600;color:#445;background:transparent}
+  .topnav a:hover{background:#eef1f5}
+  .topnav a.active{background:#2b6289;color:#fff}</style>
+</head>
+<body>
+  <nav class="topnav"><a href="/">Home</a><a href="workout.html">Workout</a></nav>
+<h1>Control Limits</h1>
+<p class="sub">Domain blocking gateway. Blocked domains resolve to 0.0.0.0.</p>
+<div id="bypbanner" class="banner hidden"></div>
+<form id="addform">
+  <label>Name</label>
+  <input name="name" placeholder="e.g. Social" required>
+  <label>Type</label>
+  <select name="type">
+    <option value="absolute">Absolute (always blocked)</option>
+    <option value="time">Time (grace then block)</option>
+  </select>
+  <label>Domains (comma separated)</label>
+  <input name="domains" placeholder="youtube.com,tiktok.com" required>
+  <div id="timefields" style="display:none">
+    <label>Freedom (grace) minutes</label>
+    <input name="grace_min" type="number" value="40" min="1">
+    <label>Blocked (cooldown) minutes</label>
+    <input name="cooldown_min" type="number" value="120" min="1">
+  </div>
+  <button type="submit">Add limit</button>
+  <div class="err" id="err"></div>
+  <div class="ok" id="ok"></div>
+</form>
+
+<div class="grid" id="limits"></div>
+<div class="statline" id="stats">loading stats…</div>
+
+
+
+<script>
+const $ = s => document.querySelector(s);
+const timefields = $("#addform").querySelector('[name="type"]');
+timefields.addEventListener("change", () => {
+  $("#timefields").style.display = timefields.value === "time" ? "block" : "none";
+});
+
+async function addLimit(e){
+  e.preventDefault();
+  const f = e.target;
+  const rec = {
+    name: f.name.value,
+    type: f.type.value,
+    domains: f.domains.value.split(",").map(s=>s.trim()).filter(Boolean),
+  };
+  if(f.type.value === "time"){
+    rec.grace_min = parseInt(f.grace_min.value||40,10);
+    rec.cooldown_min = parseInt(f.cooldown_min.value||120,10);
+  }
+  $("#err").textContent="";$("#ok").textContent="";
+  try{
+    const r = await fetch("/api/limits",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(rec)});
+    const j = await r.json();
+    if(!r.ok){ $("#err").textContent = j.error || ("HTTP "+r.status); return; }
+    $("#ok").textContent = "Added \""+j.name+"\" (id "+j.id+")";
+    f.reset(); $("#timefields").style.display="none";
+    load();
+  }catch(err){ $("#err").textContent = "Request failed: "+err.message; }
+}
+$("#addform").addEventListener("submit", addLimit);
+
+async function load(){
+  const r = await fetch("/api/limits");
+  const limits = await r.json();
+  const el = $("#limits"); el.innerHTML="";
+  const now = Date.now();
+  limits.forEach(l => el.appendChild(render(l, now)));
+  if(!limits.length) el.innerHTML = "<p class=lim>No limits yet. Add one above.</p>";
+}
+
+function fmt(ms){
+  ms = Math.max(0, Math.round(ms/1000));
+  const h = String(Math.floor(ms/3600)).padStart(2,"0");
+  const m = String(Math.floor((ms%3600)/60)).padStart(2,"0");
+  const s = String(ms%60).padStart(2,"0");
+  return h+":"+m+":"+s;
+}
+
+function render(l, now){
+  const card = document.createElement("div"); card.className="card";
+  const tag = l.type==="absolute"
+    ? '<span class="tag t-abs">ABSOLUTE</span>'
+    : '<span class="tag t-time">TIME</span>';
+  let body="";
+  if(l.type==="absolute"){
+    body = `<div class="state st-blocked">Always blocked</div>`;
+  } else {
+    let st, cls, cnt, lim;
+    if(l.state==="free"){
+      if(l.grace_until!=null){
+        st="Freedom → blocked in"; cls="st-free"; cnt=fmt(l.grace_until-now); lim="grace";
+      } else { st="Free (access to start timer)"; cls="st-free"; cnt="—"; lim="";
+      }
+    } else {
+      if(l.cooldown_until!=null){
+        st="Blocked → free in"; cls="st-blocked"; cnt=fmt(l.cooldown_until-now); lim="cooldown";
+      } else { st="Blocked"; cls="st-blocked"; cnt="—"; }
+    }
+    body = `<div class="state ${cls}">${st}</div>
+            <div class="count">${cnt}</div>
+            <div class="lim">${l.type} · grace ${Math.round(l.grace_ms/60000)}m · cooldown ${Math.round(l.cooldown_ms/60000)}m</div>`;
+  }
+  card.innerHTML = `<h2>${l.name||"(untitled)"} ${tag}</h2>
+    <div class="doms">${(l.domains||[]).join(", ")}</div>${body}`;
+  return card;
+}
+
+async function loadBypass(){
+  let d;
+  try { d = await (await fetch("/api/bypass")).json(); }
+  catch(e){ return; }
+  let el = $("#bypbanner");
+  if(!el){ el=document.createElement("div"); el.id="bypbanner"; el.className="banner hidden"; $(".sub").after(el); }
+  el.classList.remove("hidden","b-red","b-amber","b-green");
+  const ob = el.querySelector("button"); if(ob) ob.remove();
+  const mk=()=>{ const b=document.createElement("button"); b.className="brn"; return b; };
+  if(d.reward && d.reward.active){
+    el.classList.add("b-green");
+    el.innerHTML = `🎁 No-block pass ACTIVE — every site resolves normally for <span class=why>${Math.ceil(d.reward.left_ms/60000)} min</span>`;
+  } else if(d.effective_nuclear){
+    el.classList.add("b-red");
+    el.innerHTML = `⛔ ALL BLOCKED <span class=why>${d.reason||"bypass detected"}</span>`;
+    if(!d.override){
+      const b=mk(); b.textContent="I handled it — ignore detection";
+      b.onclick=async()=>{ await fetch("/api/bypass/override",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({enabled:true})}); loadBypass(); };
+      el.appendChild(b);
+    }
+  } else if(d.override){
+    el.classList.add("b-amber");
+    el.innerHTML = `⚠ Parent override ACTIVE — bypass detection ignored <span class=why>${(d.detected&&d.detected.vpn&&d.detected.vpn.why)||""}</span>`;
+    const b=mk(); b.textContent="Re-enable detection";
+    b.onclick=async()=>{ await fetch("/api/bypass/override",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({enabled:false})}); loadBypass(); };
+    el.appendChild(b);
+  } else {
+    const ff = d.detected && d.detected.firefox;
+    if(ff && ff.running){
+      el.classList.add("b-green");
+      el.innerHTML = ff.using_gateway
+        ? `✓ DNS control armed — Firefox resolving through gateway`
+        : `✓ Firefox open — control engages automatically at the first DNS lookup`;
+    }
+  }
+  try {
+    const s = await (await fetch("/api/stats")).json();
+    $("#stats").textContent = `plain-DNS ${s.udp[0]} q / ${s.udp[1]} blocked   ·   DoH ${s.doh[0]} q / ${s.doh[1]} blocked`;
+  } catch(e){}
+}
+
+
+loadBypass();
+setInterval(load, 1000);
+setInterval(loadBypass, 2000);
+</script>
+</body>
+</html>

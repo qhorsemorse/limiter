@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Workout — Control Limits</title>
+<style>
+  :root{color-scheme:light}
+  body{font-family:ui-monospace,sans-serif;margin:0;padding:24px;background:#f4f6fb;color:#1b1b1b}
+  h1{font-size:22px;margin:0 0 4px}
+  .sub{color:#666;margin:0 0 20px;font-size:13px}
+  .card{background:#fff;border:1px solid #e0e0e0;border-radius:10px;padding:16px;box-shadow:0 1px 3px rgba(0,0,0,.05)}
+  .card h2{margin:0 0 2px;font-size:16px}
+  .tag{display:inline-block;font-size:11px;padding:2px 8px;border-radius:10px;margin-left:8px;vertical-align:middle}
+  .t-time{background:#e6f0fc;color:#269}
+  .topnav{max-width:540px;margin:0 0 18px;padding:6px;background:#fff;border:1px solid #e0e0e0;border-radius:10px;
+          box-shadow:0 1px 3px rgba(0,0,0,.05);display:flex;gap:16px}
+  .topnav a{padding:8px 16px;border-radius:6px;text-decoration:none;font-weight:600;color:#445;background:transparent}
+  .topnav a:hover{background:#eef1f5}
+  .topnav a.active{background:#2b6289;color:#fff}
+  .workout{max-width:540px;margin:4px 0 18px}
+  .wsub{color:#667;font-size:13px;margin:6px 0 12px}
+  .wtimer{font-family:ui-monospace,Menlo,monospace;font-size:52px;font-weight:700;text-align:center;letter-spacing:2px;
+          padding:26px 10px;background:#f7f9fc;border:2px dashed #b9c4d6;border-radius:12px;color:#334;user-select:none;
+          transition:border-color .15s, background .15s, color .15s}
+  .wtimer.hover{border-style:solid;border-color:#2b6289;background:#eaf2f9;color:#1b4a6b}
+  .wstate{margin-top:10px;font-size:14px;min-height:20px}
+  #wactions button{margin-top:10px;width:100%;padding:9px 16px;border:none;border-radius:6px;color:#fff;background:#2b6289;cursor:pointer}
+  .wpick{margin:10px 0 4px;flex-wrap:wrap;display:flex;gap:8px;align-items:center;font-size:13px}
+  .wpick select{padding:4px 8px;border-radius:6px;border:1px solid #b9c4d6;background:#fff}
+  .wpick select:disabled{background:#eef1f5;color:#778}
+  .wpick .wnote{color:#667;font-size:12px}
+</style>
+</head>
+<body>
+  <nav class="topnav"><a href="/">Home</a><a href="workout.html" class="active">Workout</a></nav>
+  <h1>Workout</h1>
+  <p class="sub">Hover the timer to burn a one-time no-block pass. Only once a day.</p>
+  <div class="card workout">
+    <h2>Workout <span class="tag t-time">1× a day · min 25 min · renews 00:00</span></h2>
+    <div class="wsub" id="wsub">Loading…</div>
+    <div id="wpick" class="wpick">
+      <label for="wdur">Today's workout length</label>
+      <select id="wdur"></select>
+      <span class="wnote" id="wdurnote"></span>
+    </div>
+    <div id="wtimer" class="wtimer">--:--</div>
+    <div id="wstatus" class="wstate">loading…</div>
+    <div id="wactions"></div>
+  </div>
+  <script>
+    const $ = s => document.querySelector(s);
+    const WK = { st: null, hover: false, timer: null, pending: 0, lastRef: 0 };
+
+    async function wLoad(){
+      try { WK.st = await (await fetch("/api/workout")).json(); }
+      catch(e){ return; }
+      wRender();
+    }
+    function wms(ms){
+      ms = Math.max(0, Math.round(ms/1000));
+      const h = Math.floor(ms/3600), m = Math.floor((ms%3600)/60), s = ms%60, p = n => String(n).padStart(2,"0");
+      return h ? p(h)+":"+p(m)+":"+p(s) : p(m)+":"+p(s);
+    }
+    function msToMidnight(){
+      const n = new Date();
+      return new Date(n.getFullYear(), n.getMonth(), n.getDate()+1, 0, 0, 0) - n;
+    }
+    function wPick(){
+      const st = WK.st; if(!st) return;
+      const sel = $("#wdur"), note = $("#wdurnote");
+      const free = !st.started && !st.complete;
+      if(free){
+        sel.disabled = false;
+        if(!sel.dataset.init){
+          sel.dataset.init = "1";
+          [25,30,40,45,60,90,120,180].forEach(m=>{
+            const o = document.createElement("option");
+            o.value = m*60000; o.textContent = m + " min";
+            sel.appendChild(o);
+          });
+          sel.onchange = async () => {
+            try{
+              const r = await fetch("/api/workout",{method:"POST",headers:{"Content-Type":"application/json"},
+                body:JSON.stringify({action:"set_duration", ms:+sel.value})});
+              const j = await r.json();
+              if(!r.ok){ $("#wstatus").textContent = "⚠ " + (j.error || "could not set duration"); }
+              wLoad();
+            }catch(e){}
+          };
+        }
+        if(![...sel.options].some(o=>+o.value===st.duration_ms)){
+          const o = document.createElement("option");
+          o.value = st.duration_ms;
+          o.textContent = Math.round(st.duration_ms/60000) + " min (current)";
+          sel.appendChild(o);
+        }
+        sel.value = String(st.duration_ms);
+        note.textContent = "Reward grows with length (hardcoded y = square-root of x * natural-log(x) * 0.9), x in minutes → ~" +
+          wms(st.reward_preview_ms) + " no-block pass.";
+      } else {
+        sel.disabled = true;
+        note.textContent = "Locked for today (" + wms(st.duration_ms) + ") — the choice reopens after 00:00.";
+      }
+    }
+    function wRender(){
+      const st = WK.st; if(!st) return;
+      const t = $("#wtimer"), s = $("#wstatus"), a = $("#wactions");
+      a.innerHTML = "";
+      wPick();
+      const rw = wms(st.reward_preview_ms);
+      $("#wsub").textContent = st.reward_active
+        ? "The no-block pass is active — every site (blocked ones included) resolves normally for the time on the timer."
+        : "The timer runs only while your cursor is on it (move away = pause). It must reach zero — a partial workout earns nothing. Finish it to earn a " +
+          "~" + rw + " no-block pass: redeemable once today, vanishes at 00:00. Progress is tracked by the gateway, so it cannot be faked from here.";
+      if(st.reward_active){
+        t.onmouseenter = null; t.onmouseleave = null;
+        t.classList.remove("hover");
+        t.textContent = wms(st.reward_left_ms);
+        s.textContent = "Pass active — turns off by itself after the countdown.";
+        return;
+      }
+      t.onmouseenter = wEnter; t.onmouseleave = wLeave;
+      t.classList.toggle("hover", WK.hover);
+      if(st.complete && !st.redeemed){
+        t.textContent = "DONE";
+        s.textContent = "Workout complete! Redeem your " + rw + " no-block pass now." +
+          " The reward exists only for today (vanishes at 00:00).";
+        const b = document.createElement("button");
+        b.textContent = "REDEEM — " + rw + ", no blocks";
+        b.onclick = async () => {
+          b.disabled = true;
+          try{
+            const r = await fetch("/api/workout",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"redeem"})});
+            const j = await r.json();
+            if(!r.ok){ s.textContent = "⚠ " + (j.error || "could not redeem"); b.disabled = false; return; }
+          }catch(e){ b.disabled = false; }
+          wLoad();
+        };
+        a.appendChild(b);
+        return;
+      }
+      if(st.complete){
+        t.textContent = "DONE";
+        s.textContent = "Reward used up for today. Today's workout is gone — a fresh one appears at 00:00 (in " + wms(msToMidnight()) + ").";
+        return;
+      }
+      t.textContent = wms(st.remaining_ms);
+      s.textContent = st.accrued_ms > 0
+        ? "Paused (cursor was off the timer). Hover it again to keep counting. If you stop now, today's workout is over — no reward (it didn't reach zero)."
+        : "Hover the big timer to start today's workout (this locks the length choice).";
+    }
+    function wEnter(){
+      if(!WK.st || WK.st.complete || WK.st.reward_active) return;
+      WK.hover = true;
+      WK.lastRef = performance.now();
+      WK.pending = 0;
+      if(!WK.timer) WK.timer = setInterval(wTick, 100);
+      fetch("/api/workout",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"start"})}).catch(()=>{});
+      wRender();
+    }
+    function wLeave(){
+      if(WK.timer){ clearInterval(WK.timer); WK.timer = null; }
+      wFlush();
+      WK.hover = false;
+      wRender();
+    }
+    function wTick(){
+      const nowp = performance.now();
+      WK.pending += nowp - WK.lastRef;
+      WK.lastRef = nowp;
+      if(WK.pending >= 900) wFlush();
+      if(WK.st && !WK.st.complete && !WK.st.reward_active)
+        $("#wtimer").textContent = wms(WK.st.remaining_ms - WK.pending);
+    }
+    async function wFlush(){
+      const delta = Math.floor(WK.pending);
+      WK.pending = 0;
+      WK.lastRef = performance.now();
+      if(delta <= 0) return;
+      try{
+        const r = await fetch("/api/workout",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"tick", delta_ms: delta})});
+        const j = await r.json();
+        if(j && j.date){ WK.st = j; if(j.complete) wLeave(); wRender(); }
+      }catch(e){ WK.pending += delta; }
+    }
+
+    wLoad();
+    setInterval(wLoad, 10000);   // picks up reward expiry + 00:00 refresh while page stays open
+  </script>
+</body>
+</html>

@@ -1,0 +1,19 @@
+[Unit]
+Description=Control Limits Central (limits + admin only)
+Documentation=file:///home/pietro/limiter/README.md
+After=network.target
+
+[Service]
+Type=simple
+# Central role: holds all limits (single source of truth) and serves the
+# admin UI/API only. Nobody browses through the central, so the plain-DNS
+# sinkhole, the DoH front-door, and the device-local bypass watcher are off.
+# See tools/run_central.py — a thin launcher for app.py in central-only mode.
+WorkingDirectory=__BASE__
+ExecStart=python3 __BASE__/run_central.py --web 8080 --db __BASE__/data/limits.db
+Restart=always
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,21 @@
+[Unit]
+Description=Control Limits Secondary (child device) Gateway
+Documentation=file:///home/pietro/limiter/README.md
+After=network.target
+
+[Service]
+Type=simple
+# Start at boot, auto-re restart. Runs as long as the device is in use.
+# --central must point at the central Control Limits server (the single
+# source of truth for limits). This device's Firefox is pointed at this
+# machine's DoH front-door (see tools/setup_firefox.sh) — that is how this
+# secondary enforces the CENTRAL's limits on THIS device.
+WorkingDirectory=__BASE__
+ExecStart=python3 __BASE__/run_secondary.py --central __CENTRAL__ --web 8080 --dohport 8443 --certdir __BASE__/certs --uphost 127.0.0.53 --ttl 30
+Restart=always
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+Environment=CONTROL_LIMITS_CENTRAL=__CENTRAL__
+
+[Install]
+WantedBy=default.target

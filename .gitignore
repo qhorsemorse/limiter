@@ -1,0 +1,26 @@
+# ---------------------------------------------------------------------------
+# Local runtime state — contains PERSONAL data (your limits/blocked sites,
+# logs, managed Firefox profiles, sync cache). NEVER publish these.
+# Regenerate/import on a fresh clone as documented in README / tools/.
+# ---------------------------------------------------------------------------
+/data/
+*.db
+*.db-wal
+*.db-shm
+*.pid
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# Regenerated local TLS material. Private keys (ca.key/server.key) must
+# NEVER leave this machine. Recreate on a fresh clone with:
+#     bash tools/gen_certs.sh
+/certs/
+
+# Junk
+*.tmp
+*.bak
+.DS_Store
+*~
