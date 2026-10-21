@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Work — Control Limits</title>
+<style>
+  :root{color-scheme:light}
+  body{font-family:ui-monospace,sans-serif;margin:0;padding:24px;background:#f4f6fb;color:#1b1b1b}
+  h1{font-size:22px;margin:0 0 4px}
+  .sub{color:#666;margin:0 0 20px;font-size:13px}
+  .card{background:#fff;border:1px solid #e0e0e0;border-radius:10px;padding:16px;box-shadow:0 1px 3px rgba(0,0,0,.05)}
+  .card h2{margin:0 0 2px;font-size:16px}
+  .tag{display:inline-block;font-size:11px;padding:2px 8px;border-radius:10px;margin-left:8px;vertical-align:middle}
+  .t-abs{background:#e6f0fc;color:#269}
+  .doms{color:#444;font-size:13px;margin:8px 0;word-break:break-word}
+  .count{font-family:mono;font-size:20px;margin:6px 0}
+  .lim{color:#777;font-size:12px}
+  .topnav{max-width:540px;margin:0 0 18px;padding:6px;background:#fff;border:1px solid #e0e0e0;border-radius:10px;
+          box-shadow:0 1px 3px rgba(0,0,0,.05);display:flex;gap:16px}
+  .topnav a{padding:8px 16px;border-radius:6px;text-decoration:none;font-weight:600;color:#445;background:transparent}
+  .topnav a:hover{background:#eef1f5}
+  .topnav a.active{background:#2b6289;color:#fff}
+  .work{max-width:540px;margin:4px 0 18px}
+  .wsub{color:#667;font-size:13px;margin:6px 0 12px}
+  .wtimer{font-family:ui-monospace,Menlo,monospace;font-size:52px;font-weight:700;text-align:center;letter-spacing:2px;
+          padding:26px 10px;background:#f7f9fc;border:2px dashed #b9c4d6;border-radius:12px;color:#334;user-select:none;
+          transition:border-color .15s, background .15s, color .15s}
+  .wtimer.work{border-style:solid;border-color:#2b6289;background:#eaf2f9;color:#1b4a6b}
+  .wtimer.done{border-style:solid;border-color:#2a8;background:#e8f5e8;color:#272}
+  .wtimer.penalty{border-style:solid;border-color:#c42;background:#f7ede9;color:#a11}
+  .wstate{margin-top:10px;font-size:14px;min-height:20px}
+  #wactions button{margin-top:10px;width:100%;padding:9px 16px;border:none;border-radius:6px;color:#fff;background:#2b6289;cursor:pointer}
+  .wpick{margin:10px 0 4px;flex-wrap:wrap;display:flex;gap:8px;align-items:center;font-size:13px;flex-wrap:wrap}
+  .wpick select,.wpick input{padding:4px 8px;border-radius:6px;border:1px solid #b9c4d6;background:#fff}
+  .wpick input{width:90px}
+  .wpick .wnote{color:#667;font-size:12px}
+  .prog{height:12px;background:#eef1f5;border-radius:6px;margin:6px 0 2px;overflow:hidden}
+  .prog > div{height:100%;background:#2b6289;width:0%;transition:width .3s}
+  .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px;margin:12px 0}
+  .wcard{background:#fff;border:1px solid #e0e0e0;border-radius:10px;padding:12px;box-shadow:0 1px 3px rgba(0,0,0,.05);cursor:pointer}
+  .wcard.active{border-color:#2b6289;background:#f7f9fc}
+  .wcard .wcard-acc{font-family:mono;font-size:15px}
+  .wdel{float:right;background:#eee;border:none;border-radius:6px;color:#c42;cursor:pointer;font-size:14px;line-height:1}
+  .addrow{display:flex;gap:8px;max-width:540px;margin:0 0 16px}
+  .addrow input,.addrow select{padding:6px 8px;border-radius:6px;border:1px solid #ccc}
+  .addrow input{flex:1}
+  .addrow button{padding:6px 14px;border:none;border-radius:6px;color:#fff;background:#2b6289;cursor:pointer}
+</style>
+</head>
+<body>
+  <nav class="topnav"><a href="/">Home</a><a href="workout.html">Workout</a><a href="work.html" class="active">Work</a></nav>
+  <h1>Work</h1>
+  <p class="sub">Burn focused work time against a minimum. While a session runs <strong>everything is blocked</strong>
+     (no site you could get distracted on). Reach the minimum to finish; run the timer out first and you get punished.</p>
+  <div class="card work">
+    <h2>Work <span class="tag t-abs">button timer · min enforced · penalty on fail</span></h2>
+    <div class="wsub" id="wsub">Loading…</div>
+
+    <div id="wpick" class="wpick">
+      <label for="wlim">Minimum (shared by all tasks)</label>
+      <input id="wlim" type="number" min="1" placeholder="min">
+      <span class="wnote" id="wlimnote"></span>
+    </div>
+    <div id="wpickb" class="wpick">
+      <label for="wbud">Work timer (max time)</label>
+      <input id="wbud" type="number" min="1" placeholder="timer">
+      <span class="wnote" id="wbudnote"></span>
+    </div>
+
+    <div id="wtimer" class="wtimer">--:--</div>
+    <div class="prog"><div id="wprog"></div></div>
+    <div id="wacc" class="lim"></div>
+    <div id="wstatus" class="wstate">loading…</div>
+    <div id="wactions"></div>
+  </div>
+
+  <div class="addrow">
+    <input id="cname" placeholder="Task name (e.g. Email inbox)">
+    <select id="ckind">
+      <option value="task">task</option>
+      <option value="research">research</option>
+      <option value="writing">writing</option>
+      <option value="review">review</option>
+      <option value="communication">communication</option>
+    </select>
+    <button id="cadd">Add task</button>
+  </div>
+  <div class="cards" id="wcards"></div>
+
+  <script>
+    const $ = s => document.querySelector(s);
+    const WK = { st: null, working: false, timer: null, pending: 0, lastRef: 0 };
+
+    async function wLoad(){
+      try { WK.st = await (await fetch("/api/work")).json(); }
+      catch(e){ return; }
+      wRender();
+    }
+    function wms(ms){
+      ms = Math.max(0, Math.round(ms/1000));
+      const h = Math.floor(ms/3600), m = Math.floor((ms%3600)/60), s = ms%60, p = n => String(n).padStart(2,"0");
+      return (h ? p(h)+":"+p(m)+":"+p(s) : p(m)+":"+p(s));
+    }
+    function acmd(ms){
+      ms = Math.max(0, Math.round(ms/1000));
+      const h = Math.floor(ms/3600), m = Math.floor((ms%3600)/60);
+      return (h?h+"h ":"")+m+"m"+(ms%60?" "+(ms%60)+"s":"");
+    }
+
+    // ---------- card management ----------
+    async function addCard(){
+      const name = $("#cname").value.trim();
+      const kind = $("#ckind").value;
+      $("#cname").value="";
+      try{
+        const r = await fetch("/api/work",{method:"POST",headers:{"Content-Type":"application/json"},
+          body:JSON.stringify({action:"add_card", name, kind})});
+        await r.json();
+      }catch(e){}
+      wLoad();
+    }
+    async function removeCard(cid){
+      try{
+        const r = await fetch("/api/work",{method:"POST",headers:{"Content-Type":"application/json"},
+          body:JSON.stringify({action:"remove_card", cid})});
+        await r.json();
+      }catch(e){}
+      wLoad();
+    }
+    async function focusCard(cid){
+      try{
+        const r = await fetch("/api/work",{method:"POST",headers:{"Content-Type":"application/json"},
+          body:JSON.stringify({action:"set_active_card", cid})});
+        await r.json();
+      }catch(e){}
+      wLoad();
+    }
+    async function setNum(action, el, noteEl, noteFn, min){
+      const v = parseInt(el.value,10);
+      if(!el.value || isNaN(v) || v < (min||1)) return;
+      try{
+        const r = await fetch("/api/work",{method:"POST",headers:{"Content-Type":"application/json"},
+          body:JSON.stringify({action, ms:v*1000})});
+        const j = await r.json();
+        if(!r.ok){ $("#wstatus").textContent = "⚠ " + (j.error||"could not update"); }
+      }catch(e){}
+      el.value="";
+      wLoad();
+    }
+
+    // ---------- rendering ----------
+    function wRender(){
+      const st = WK.st; if(!st) return;
+      const t = $("#wtimer"), s = $("#wstatus"), a = $("#wactions");
+      a.innerHTML = "";
+
+      // picks
+      const lim = $("#wlim"), lnote = $("#wlimnote");
+      lim.placeholder = Math.round(st.limit_ms/60000)+" (locked floor)";
+      lnote.textContent = "Shared minimum across all tasks. Can only grow from here — never shrink.";
+      const bud = $("#wbud"), bnote = $("#wbudnote");
+      bud.placeholder = Math.round(st.budget_ms/60000);
+      bnote.textContent = "Max time for today. Can only be set higher.";
+      $("#wlim").onchange = ()=>setNum("set_limit", lim, lnote, null, 1);
+      $("#wbud").onchange = ()=>setNum("set_budget", bud, bnote, null, 1);
+
+      // timer
+      t.classList.toggle("work", st.session==="working" || st.session==="paused");
+      t.classList.toggle("done", st.session==="success");
+      t.classList.toggle("penalty", st.session==="failed" || st.penalty_active);
+
+      const done = st.session==="success";
+      const failed = st.session==="failed" || st.penalty_active;
+      if(failed){
+        t.textContent = wms(st.remaining_ms);
+      } else {
+        t.textContent = wms(st.session==="working" ? (st.remaining_ms - WK.pending) : st.remaining_ms);
+      }
+
+      // progress vs the shared minimum
+      const pct = Math.min(100, Math.round(100 * st.accrued_ms / Math.max(1, st.limit_ms)));
+      $("#wprog").style.width = pct + "%";
+      $("#wacc").textContent = "Worked " + acmd(st.accrued_ms) + " / minimum " + acmd(st.limit_ms)
+        + "  ·  timer " + acmd(st.budget_ms);
+
+      const rw = "for " + acmd(st.budget_ms);
+      if(st.penalty_active){
+        t.onmouseenter = null; t.onmouseleave = null;
+        s.innerHTML = "😹 <strong>Punished</strong> — you ran the timer out before reaching the minimum. Everything stays " +
+          "blocked for another " + acmd(st.penalty_left_ms) + " so you can't sneak work in. Rest, then start fresh at 00:00.";
+        return;
+      }
+      if(done){
+        t.onmouseenter = null; t.onmouseleave = null;
+        s.textContent = "✅ Done — you hit the minimum before the timer ran out. No penalty. The block is off; progress resets at 00:00.";
+        return;
+      }
+
+      // build the start/pause/resume button
+      let btn;
+      if(st.session==="idle"){
+        t.onmouseenter = null; t.onmouseleave = null;
+        t.classList.remove("work");
+        s.textContent = "Add tasks below, then press Start Work. The timer only counts while you press it — pause while you're idle, resume when you work again.";
+        btn = document.createElement("button");
+        btn.textContent = "▶ Start Work (" + acmd(st.budget_ms) + " timer, min " + acmd(st.limit_ms) + ")";
+        btn.onclick = startOrToggle;
+        a.appendChild(btn);
+      } else if(st.session==="working"){
+        s.textContent = "Working — everything is blocked right now so nothing distracts you. Press Pause when you step away, Resume to keep going.";
+        btn = document.createElement("button");
+        btn.textContent = "❍ Pause";
+        btn.onclick = startOrToggle;
+        a.appendChild(btn);
+        if(!WK.timer) startTicking();
+      } else if(st.session==="paused"){
+        t.classList.remove("work");
+        s.textContent = "Paused — the timer is frozen. Resume when you're ready to work again (the block stays on for the whole session).";
+        btn = document.createElement("button");
+        btn.textContent = "▶ Resume";
+        btn.onclick = startOrToggle;
+        a.appendChild(btn);
+        stopTicking();
+      }
+
+      renderCards();
+    }
+
+    function renderCards(){
+      const box = $("#wcards"); box.innerHTML="";
+      const st = WK.st;
+      if(!st.cards.length){ box.innerHTML = '<p class="lim">No tasks yet. Add one above.</p>'; return; }
+      st.cards.forEach(c=>{
+        const el = document.createElement("div");
+        el.className = "wcard" + (c.id===st.active_card_id ? " active":"");
+        el.onclick = (e)=>{ if(!e.target.classList.contains("wdel")) focusCard(c.id); };
+        el.innerHTML = `<button class="wdel" title="remove">✕</button>
+          <h2>${c.name||"(untitled)"} <span class="tag t-abs">${c.kind||"task"}</span></h2>
+          <div class="wcard-acc">Worked <b>${acmd(c.accrued_ms||0)}</b></div>
+          <div class="lim">click to focus · this is the task the timer attributes time to</div>`;
+        el.querySelector(".wdel").onclick = (e)=>{ e.stopPropagation(); removeCard(c.id); };
+        box.appendChild(el);
+      });
+    }
+
+    // ---------- tick loop (button-driven; like hover in workout) ----------
+    function startTicking(){
+      if(WK.timer) return;
+      WK.lastRef = performance.now();
+      WK.pending = 0;
+      WK.timer = setInterval(wTick, 100);
+    }
+    function stopTicking(){
+      if(WK.timer){ clearInterval(WK.timer); WK.timer = null; }
+      wFlush();
+    }
+    function wTick(){
+      const nowp = performance.now();
+      WK.pending += nowp - WK.lastRef;
+      WK.lastRef = nowp;
+      if(WK.pending >= 900) wFlush();
+      if(WK.st && WK.st.session==="working"){
+        $("#wtimer").textContent = wms(WK.st.remaining_ms - WK.pending);
+      }
+    }
+    async function wFlush(){
+      const delta = Math.floor(WK.pending);
+      WK.pending = 0;
+      WK.lastRef = performance.now();
+      if(delta <= 0) return;
+      try{
+        const r = await fetch("/api/work",{method:"POST",headers:{"Content-Type":"application/json"},
+          body:JSON.stringify({action:"tick", delta_ms: delta})});
+        const j = await r.json();
+        if(j){ WK.st = j; }
+      }catch(e){ WK.pending += delta; }
+    }
+
+    async function startOrToggle(){
+      const act = (WK.st && WK.st.session === "working") ? "pause" : (WK.st && WK.st.session === "paused") ? "resume" : "start";
+      try{
+        const r = await fetch("/api/work",{method:"POST",headers:{"Content-Type":"application/json"},
+          body:JSON.stringify({action:act})});
+        const j = await r.json();
+        if(j && !r.ok){ $("#wstatus").textContent = "⚠ " + (j.error||"request failed"); }
+      }catch(e){}
+      // reconcile the local tick state with the server session
+      const wasWorking = WK.st && WK.st.session === "working";
+      if(act==="start"){ if(!wasWorking){ WK.pending=0; WK.lastRef=performance.now(); } startTicking(); }
+      else if(act==="pause"){ stopTicking(); }
+      else if(act==="resume"){ startTicking(); }
+      wLoad();
+    }
+
+    $("#cadd").addEventListener("click", addCard);
+    $("#cname").addEventListener("keydown", e=>{ if(e.key==="Enter"){ e.preventDefault(); addCard(); } });
+
+    wLoad();
+    setInterval(wLoad, 5000);   // picks up penalty expiry + 00:00 refresh while the page stays open
+  </script>
+</body>
+</html>

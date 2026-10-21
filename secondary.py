@@ -30,7 +30,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE)
-import dns as DNS, engine as E, bypass as B, doh as DOH, workout as W
+import dns as DNS, engine as E, bypass as B, doh as DOH, workout as W, work as WK
 from remote_store import RemoteStore
 
 DATA = os.path.join(BASE, "data")
@@ -39,6 +39,7 @@ CACHE_DB = os.environ.get("REMOTE_CACHE_DB", os.path.join(DATA, "remote_cache.db
 WORKOUT_FILE = os.environ.get("WORKOUT_FILE", os.path.join(DATA, "workout.json"))
 INDEX_HTML = open(os.path.join(BASE, "secondary_index.html"), "r", encoding="utf-8").read()
 WORKOUT_HTML = open(os.path.join(BASE, "workout.html"), "r", encoding="utf-8").read()
+WORK_HTML = open(os.path.join(BASE, "work.html"), "r", encoding="utf-8").read()
 
 _state = {"last": {}, "streak": 0}
 
@@ -76,6 +77,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, HTML, "text/html; charset=utf-8")
         if path == "/workout.html":
             return self._send(200, WORKOUT_HTML, "text/html; charset=utf-8")
+        if path == "/work.html":
+            return self._send(200, WORK_HTML, "text/html; charset=utf-8")
         if path == "/api/limits":
             # READ-ONLY mirror of the central's limits, pulled from the local cache.
             return self._send(200, [self._view(l) for l in STORE.snapshot()])
@@ -89,6 +92,8 @@ class Handler(BaseHTTPRequestHandler):
                                     "online": bool(s.online), "emergency": bool(s.emergency)})
         if path == "/api/workout":
             return self._send(200, WORKOUT.status())
+        if path == "/api/work":
+            return self._send(200, WORK.status())
         return self._send(404, {"error": "not found"})
 
     def do_POST(self):
@@ -113,6 +118,42 @@ class Handler(BaseHTTPRequestHandler):
                 st, err = w.set_duration(rec.get("ms"))
                 return self._send(400 if err else 200, {**st, **(None if not err else {"error": err})})
             return self._send(400, {"error": "unknown action"})
+        if path == "/api/work":
+            try:
+                length = int(self.headers.get("Content-Length", 0) or 0)
+                rec = json.loads(self.rfile.read(length).decode() if length else "{}")
+                action = rec.get("action")
+            except Exception:
+                return self._send(400, {"error": "invalid json"})
+            w = WORK
+            st = w.status()
+            if action == "add_card":
+                st = w.add_card(rec.get("name"), rec.get("kind"))
+            elif action == "remove_card":
+                st = w.remove_card(rec.get("cid"))
+            elif action == "set_budget":
+                st = w.set_budget(rec.get("ms"))
+            elif action == "set_limit":
+                st = w.set_limit(rec.get("ms"))
+            elif action == "set_penalty":
+                st = w.set_penalty(rec.get("ms"))
+            elif action == "set_active_card":
+                st = w.set_active_card(rec.get("cid"))
+            elif action == "start":
+                st = w.start()
+            elif action == "pause":
+                st = w.pause()
+            elif action == "resume":
+                st = w.resume()
+            elif action == "tick":
+                st, err = w.tick(rec.get("delta_ms", 0))
+                if err:
+                    return self._send(400 if err else 200, {**st, **(None if not err else {"error": err})})
+            else:
+                return self._send(400, {"error": "unknown action"})
+            # keep the store's block-eom-thing window in sync with the session
+            STORE.set_work_until(st.get("work_until_ms", 0))
+            return self._send(200, st)
         return self._send(404, {"error": "not found"})
 
     # ---------------- helpers ----------------
@@ -217,7 +258,7 @@ def main():
     ap.add_argument("--allow-free-offline", dest="allow_free_offline", action="store_true",
                     help="while offline, forward unrestricted sites (fail-open; default is fail-closed)")
     args = ap.parse_args()
-    global CENTRAL, STORE, HTML, WORKOUT
+    global CENTRAL, STORE, HTML, WORKOUT, WORK
 
     CENTRAL = args.central or _load_central()
 
@@ -228,11 +269,19 @@ def main():
     HTML = INDEX_HTML.replace("__CENTRAL__", CENTRAL)
 
     WORKOUT = W.Workout(WORKOUT_FILE)
-    # restore any in-progress reward window across restarts (in-memory flag only)
+    WORK = WK.Work(os.environ.get("WORK_FILE", os.path.join(DATA, "work.json")))
+    # restore any in-progress reward / work-focus window across restarts (in-memory
+    # flag only — without this a restart mid-session would un-block everything).
     try:
         wst = WORKOUT.status()
         if wst.get("reward_until_ms"):
             STORE.set_reward_until(wst["reward_until_ms"])
+    except Exception:
+        pass
+    try:
+        _wku = WORK.status().get("work_until_ms", 0) or 0
+        if _wku:
+            STORE.set_work_until(_wku)
     except Exception:
         pass
 

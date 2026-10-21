@@ -37,7 +37,7 @@ be managed from *one* place and enforced on *many* devices:
   Implements the cache-first / staleness (TTL) / offline (emergency) semantics.
 
 The original single-host mode still works untouched (`app.py` with no new flags) —
-nothing regressed: **all 7 test suites are green.**
+nothing regressed: **all 8 test suites are green** (the new one is `test_work.py`).
 
 ---
 
@@ -86,7 +86,8 @@ Firefox (DoH, locked to 127.0.0.1:<dohport> on THIS device)
                  ├─ bypass watcher    (device-local nuclear detection)
                  ├─ sync ticker       (keeps the local cache fresh, TTL-driven)
                  ├─ workout (per-device, local)
-                 └─ child web UI/API  :8080   (status + READ-ONLY limits view)
+                 ├─ work          (per-device, local) — focus-session block-e window + timer, honours store.work_active(now)
+                 └─ child web UI/API  :8080   (status + READ-ONLY limits view + work nav)
                      │
                      ▼  RemoteStore — answers from a LOCAL COPY of the central DB
                      │   1. check local cache
@@ -124,8 +125,28 @@ While the device is **out of the central's LAN**:
 ## 4. FILE MAP (`/home/pietro/limiter/`)
 
 Files **unchanged** from v4 (still the single-host engine): `engine.py`, `db.py`
-(`updated_at` column added for TTL/staleness), `store.py` (added `report_access`),
-`dns.py`, `doh.py`, `bypass.py`, `workout.py`, `index.html`, `workout.html`, `tools/`.
+(`updated_at` column added for TTL/staleness), `bypass.py`, `tools/`.
+
+Files **changed** from v4 to add the **Work / focus-session** feature (a *sibling*
+of the workout with the opposite effect):
+
+| File | Change |
+|---|---|
+| `dns.py` | `resolve_bytes` gains a block-e window: while `store.work_active(now)` is true, every domain (time-limit AND absolute) resolves to `0.0.0.0` (localhost exempt) — the inverse of the workout reward pass. Placed right after the reward check and before nuclear. |
+| `store.py` / `remote_store.py` | Added `work_until`, `set_work_until(ms)`, `work_active(now)` — a per-session block-e window, synced from the Work state machine after each mutating `/api/work` action and restored on boot. |
+| `app.py` | Serves `/work.html`; `GET/POST /api/work` (add/remove/set_card/start/pause/resume/tick); restores the work block-e window on boot via `set_work_until`. |
+| `secondary.py` | Serves `/work.html`; `GET/POST /api/work`; per-device Work state machine; syncs `set_work_until` onto the `RemoteStore` so the block-e is enforced on the device. |
+| `index.html` / `workout.html` / `secondary_index.html` | Nav bar gains a **Work** link. |
+
+**NEW this session (work feature):**
+
+| File | Role | Status |
+|---|---|---|
+| `work.py` | Daily focus-session state machine: button start/pause/resume timer (cheat-capped like workout), multiple cards sharing one common monotonic minimum, per-day reset, penalty window on failure, and the `work_active` window the resolver honours. Persists to `data/work.json`. | done, tested |
+| `work.html` | Page 3 — cards, the common minimum, the timer, and the start/pause/resume button + penalty display. | done |
+| `test_work.py` | Work feature tests: unit for the state machine + live end-to-end through the real DNS resolver (session blocks every domain, penalty window, un-block on completion). | green |
+
+**this handoff's prior NEW table (central/secondary, v5) is still valid and unchanged.**
 
 **NEW this session:**
 
@@ -190,7 +211,7 @@ on `127.0.0.1:5354` means the gateway is still running. `test_bypass.py` still d
 - Single-host `limiter.service` **active** on :8443/:5354/:8080 (the old mode still works;
   not part of the central/secondary flow unless you want one box to also browse).
 - `certs/` present (shared by both central and secondaries).
-- All 7 test suites green.
+- All 8 test suites green (incl. the new `test_work.py`).
 
 ## 8. GOTCHAS (do-not-redo)
 - **Cache-first, not per-key TTL.** The `RemoteStore` cache is a *copy* of the central DB,
@@ -207,13 +228,16 @@ on `127.0.0.1:5354` means the gateway is still running. `test_bypass.py` still d
 - Snap Firefox profile lives under `~/snap/firefox/common/…`. Snap has a private /tmp.
 - `_proc/net/*` hex addresses are **host-byte-order u32** on little-endian — reverse the bytes.
 - `doh.py` uses `ThreadingHTTPServer` + `ctx.wrap_socket(server_sock)`.
+- **Work block-e window (`store.work_active(now)`)** sits in `dns.resolve_bytes` RIGHT AFTER the reward check and BEFORE nuclear — it is the inverse of the workout reward: while a work session (or penalty) is active, EVERY domain (time-limit AND absolute) resolves to `0.0.0.0` (localhost exempt). Set/clear it via `set_work_until(ms)` and re-arm it on boot. It is a per-device LOCAL concern on the secondary (synced onto the `RemoteStore`), like the workout — the central does not own it.
+- **Work minimum is monotonic** (set at the first card's creation, can only grow) and **work timer is capped by real elapsed wall-clock** between ticks (cheat-resistance, same as the workout) — never trust a big client-reported delta.
 - `index.html`/`secondary_index.html` are served stale until the browser refreshes.
 - Fail-closed offline is the default; `--allow-free-offline` flips it. Locks block always.
 
 === END HANDOFF PROMPT ===
 
 ## NEXT STEPS (in priority order)
-1. **Live end-to-end proof on real hardware.** Everything is proven in-process
+1. **Work / focus-session feature — DONE (this session).** New `work.py` + `work.html` + `test_work.py`, wired into `app.py` and `secondary.py`, with a store-level block-e window (`work_active`) that the resolver honours. All 8 suites green. Behaviour: a session blocks every domain (time-limit AND absolute) while active, has a button start/pause/resume timer, cards sharing one common monotonic minimum, and arms a penalty window when the timer runs out before the minimum is met. See README §1 + the `work.py` module doc for the exact rules.
+2. **Live end-to-end proof on real hardware.** Everything is proven in-process
    (test_secondary drives real DoH wire queries through the secondary). The one thing
    left is a real Firefox on a second device pointed at a secondary (steps in §5). If a
    blocked domain still loads, the usual causes: certs missing (DoH off), lock not

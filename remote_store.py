@@ -168,6 +168,7 @@ class RemoteStore:
         self.nuclear_reason = None
         self.override = False
         self.reward_until = 0.0
+        self.work_until = 0.0           # ms; work focus/penalty window (block everything)
         self.stats = {"udp": [0, 0], "doh": [0, 0]}
 
         # connectivity / freshness state
@@ -253,6 +254,18 @@ class RemoteStore:
         with self.lock:
             now = now if now is not None else E.now_ms()
             return bool(self.reward_until and now < self.reward_until)
+
+    def set_work_until(self, ms):
+        """Work focus / penalty window (same semantics as Store.set_work_until):
+        while active, the resolution core blocks EVERYTHING (limits AND nuclear).
+        This is a per-device LOCAL concern on the secondary, like the workout."""
+        with self.lock:
+            self.work_until = float(ms or 0)
+
+    def work_active(self, now=None):
+        with self.lock:
+            now = now if now is not None else E.now_ms()
+            return bool(self.work_until and now < self.work_until)
 
     # ---------------- reads / evaluation ----------------
     def snapshot(self):

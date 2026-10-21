@@ -108,6 +108,17 @@ def resolve_bytes(store, data, upstream, channel="udp", now=None):
             return resp, False
         # upstream unreachable: fall through to normal handling below
 
+    # --- work focus session active (or penalty pending): block EVERYTHING except
+    #     the exempt local names. This is the inverse of the workout no-block
+    #     reward pass: while you are working, every domain (time-blocked, absolute,
+    #     or free) resolves to 0.0.0.0 so there is nowhere to get distracted.
+    if store.work_active(now):
+        for name, qtype, _ in questions:
+            host = E.normalize_domain(name)
+            if host and host not in E.NUCLEAR_EXEMPT:
+                store.count(channel, True)
+                return build_blocked(tid, questions), True
+
     # --- nuclear (bypass) mode: block EVERYTHING except the exempt local names
     if store.is_nuclear():
         for name, qtype, _ in questions:

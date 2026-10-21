@@ -32,6 +32,7 @@ Firefox (DoH, locked to 127.0.0.1:8443)
             ├─ store.py    (thread-safe state bridge, sqlite persistence)
             ├─ bypass.py   (watcher: VPN / public DoH / lock tamper → NUCLEAR)
             ├─ workout.py  (daily hover-timer → √x·ln(x)·0.9 no-block reward)
+            ├─ work.py     (daily button-timer focus session → blocks everything + penalty)
             └─ web UI + API :8080 (http://PI-IP:8080)
 ```
 
@@ -64,6 +65,21 @@ Firefox (DoH, locked to 127.0.0.1:8443)
   for that duration, then reverts automatically. The workout is once per
   calendar day (renews at local 00:00); the reward is same-day-only and
   non-stackable.
+
+* **Work / focus session** (daily — a *sibling* of the workout but the opposite
+  intent). While a session is active (or a penalty is pending) the gateway blocks
+  **everything** — both time-limits and absolute limits, no matter how much
+  freedom a domain usually has — so there is nowhere to get distracted while you
+  work. It is a **button** timer (start / pause / resume), not hover: the
+  countdown freezes on pause and resumes on resume. You set a common **minimum** of
+  real work-time (shared by every *work card* — you can add several tasks of
+  different kinds) and a max **timer**. Reach the minimum before the timer runs
+  out → done, block clears; run the timer out first → a **penalty** window arms
+  (everything stays blocked, then unlocks). The minimum is locked when the first
+  card is created and can only ever grow. State and the penalty window survive
+  restarts (`data/work.json`); the block window is re-armed on boot. Cheat
+  resistance matches the workout: work-time is capped by the real elapsed
+  wall-clock between ticks, so it cannot be fast-forwarded.
 
 ---
 
@@ -131,9 +147,11 @@ curl -s --cacert /home/pietro/limiter/certs/ca.pem -H 'Content-Type: application
 | `doh.py` | TLS DNS-over-HTTPS responder (RFC 8484, wire + JSON) — the browser front-door |
 | `bypass.py` | Bypass detection (VPN peers, public-DoH sockets, Firefox process/sockets, lock-file check) + optional iptables rules (used only with `--bypass-protect`) |
 | `workout.py` | Daily workout/reward state machine (calendar-day rollover, wall-clock-capped credit, 25-min floor, √x·ln(x)·0.9 reward) |
+| `work.py` | Daily *focus-session* state machine (button start/pause/resume timer, common min across cards, monotonic min, penalty on failure, block-e window) |
 | `db.py` | sqlite schema/helpers |
 | `index.html` | page 1 — limits + bypass override (Home nav button) |
 | `workout.html` | page 2 — daily workout card (Workout nav button) |
+| `work.html` | page 3 — daily work focus session (Work nav button): cards, common min, timer, start/pause/resume, penalty |
 | `secondary_index.html` | child view served by `secondary.py` — nuclear/offline status, READ-ONLY central limits view, stats, workout nav |
 | shared `.topnav` | links between the pages; highlights the current page. No JS routing — static HTML files + routes in app.py/secondary.py.
 | `remote_store.py` | **NEW** — `CacheDB` (local copy of central `limits`) + `RemoteStore` (cache-first / staleness-TTL / offline-emergency semantics) |
@@ -142,8 +160,9 @@ curl -s --cacert /home/pietro/limiter/certs/ca.pem -H 'Content-Type: application
 | `run_secondary.py` | **NEW** — thin launcher → `secondary.py` (symmetric role entrypoint) |
 | `test_remote_store.py` | **NEW** — `RemoteStore` unit/integration tests vs a live central-only `app.py` (sync, cache-copy, staleness re-fetch, `report_access`, offline emergency) |
 | `test_secondary.py` | **NEW** — end-to-end: central(central-only) + stub upstream + secondary driving real DoH wire queries (blocked/forwarded, detect arms grace centrally) |
+| `test_work.py` | Work/focus-session feature tests (unit for the state machine + live end-to-end: work session blocks every domain through the real resolver, penalty window, un-block on completion) |
 | `tools/` | Setup & maintenance scripts (see §5) — incl. `limiter-central.service` + `install_central.sh` |
-| `test_*.py` | 7 test suites (engine, dns, doh, app, bypass, remote_store, secondary) — plain `python3 test_x.py` |
+| `test_*.py` | 8 test suites (engine, dns, doh, app, bypass, remote_store, secondary, work) — plain `python3 test_x.py` |
 | `certs/` | Self-signed CA + server cert for the DoH endpoint |
 | `data/` | Runtime state: `limits.db`, `workout.json`, `gateway.log`, pidfile, `browsers_locked.txt` |
 | `HANDOFF_CONTEXT.md` | Detailed state notes (architecture, gotchas, session history) |
@@ -196,6 +215,11 @@ Restart Firefox after step 2/3 so the profile settings apply.
 * **Bypass detected**: red banner appears (VPN / public DoH / lock tampered).
   Unblock-all until the cause is fixed, or click **Override** if you dealt with
   it. State + reason visible in `/api/bypass`.
+* **Work**: the Work page has a button timer (start / pause / resume), work cards of
+  different kinds sharing one common minimum, and a penalty. Start a session while
+  working — every site is blocked (focus mode); reach the minimum to finish and the
+  block clears, or let the timer run out and a penalty window blocks everything until
+  it clears.
 * **Workout**: big timer on the UI. Hover it to run; move away to pause.
   Before the first hover you may pick a longer duration (minimum **25 min**);
   hovering locks the choice until 00:00. The timer must reach **zero** — a
@@ -259,23 +283,31 @@ Environment variables (all optional; defaults in brackets): `WORKOUT_SECONDS [15
 (new-day default workout length, seconds; clamped to the floor),
 `MIN_WORKOUT_MS [1500000]` (hard 25-minute floor, ms — lowered only for tests),
 `DNS_PORT [5354]`, `WEB_PORT [8080]`, `DOH_PORT [8443]`, `DNS_UP [127.0.0.53]`,
-`LAN_GW [192.168.0.1]`, `WORKOUT_FILE`, `PYTHONUNBUFFERED`.
+`LAN_GW [192.168.0.1]`, `WORKOUT_FILE`, `WORK_FILE`, `PYTHONUNBUFFERED`.
 The reward length is NOT configurable — it is the hardcoded √x·ln(x)·0.9 ratio.
 
-State files: `data/limits.db` (limits), `data/workout.json` (daily workout/reward),
+Work/focus-session env vars (optional; defaults in brackets), analogous to the workout:
+`MIN_WORK_BUDGET_MS [1200000]` (hard floor of the max timer, ms — lowered only for tests),
+`MIN_WORK_MIN_MS [600000]` (hard floor of the common minimum, ms),
+`WORK_BUDGET_MS [3600000]` (default max timer for the day, ms),
+`WORK_MIN_MS [1800000]` (default common minimum for the day, ms),
+`WORK_PALTY_MS [1800000]` (default penalty window length on failure, ms).
+
+State files: `data/limits.db` (limits), `data/workout.json` (daily workout/reward), `data/work.json` (daily work focus-session/penalty),
 `data/browsers_locked.txt` (what the browser lock touched), `data/gateway.log`
 (nohup-run logs; under systemd the log is the journal: `journalctl --user -u limiter`).
 
 API (JSON): `GET /api/limits`, `POST /api/limits`, `DELETE /api/limits/<id>`,
 `GET /api/bypass`, `POST /api/bypass/override {enabled}`, `GET /api/stats`,
 `GET /api/workout`, `POST /api/workout {action: start|tick|redeem|set_duration {ms}}`,
-`GET /api/health`.
+`GET /api/work`, `POST /api/work {action: add_card|remove_card|set_budget|set_limit|set_active_card|start|pause|resume|tick}`, `GET /api/health`.
 
 ## 7. Security notes & known limits (be honest about these)
 
-* **Web UI is two pages** (`index.html` + `workout.html`) joined by a top nav bar
-  that switches between them. The server serves `index.html` at `/` and
-  `workout.html` at `/workout.html` (both static; `/api/…` serve live data).
+* **Web UI is three pages** (`index.html` + `workout.html` + `work.html`) joined by a top nav bar
+  that switches between them. The server serves `index.html` at `/`,
+  `workout.html` at `/workout.html` and `work.html` at `/work.html` (all static;
+  `/api/…` serve live data).
 * **The web UI has no authentication.** It is trusted-LAN by design: anyone on
   the LAN can read/modify limits, redeem the reward (the workout's anti-cheat
   limits are real-time-capped server-side, but a LAN client can POST ticks at
@@ -300,10 +332,10 @@ API (JSON): `GET /api/limits`, `POST /api/limits`, `DELETE /api/limits/<id>`,
 
 ```bash
 systemctl --user stop limiter        # :5354 must be free for the stub upstreams
-for t in test_engine test_dns test_doh test_app test_bypass test_remote_store test_secondary; do python3 $t.py; done
+for t in test_engine test_dns test_doh test_app test_bypass test_remote_store test_secondary test_work; do python3 $t.py; done
 systemctl --user start limiter
 ```
-All seven suites are self-contained (throwaway sqlite in /tmp, fake upstreams).
+All eight suites are self-contained (throwaway sqlite in /tmp, fake upstreams).
 `test_secondary` and `test_remote_store` also stand up a **central-only** `app.py`
 (and a stub upstream) in-process; they clean up after themselves. `test_remote_store`
 kills any stray process already bound to its ports before launching. `test_bypass.py`
@@ -317,7 +349,8 @@ security alarm).
 
 ## 9. Machine state at handoff (2026-10-16 — after central/secondary rearch)
 
-* **All 7 test suites green.** Nothing in the original single-host engine regressed.
+* **All 8 test suites green.** Nothing in the original single-host engine regressed.
+* **Work / focus-session feature is implemented and tested** (new `work.py`, `work.html`, `test_work.py`; wired into `app.py` and `secondary.py` via a new block-e window on the store). A session blocks every domain through the real resolver, the minimum is monotonic, and a failed session arms a penalty window. See README §1 + the `work.py` module doc.
 * Single-host `limiter.service` still **running** (systemd --user, lingering → auto
   at boot) on :8443/:5354/:8080. This is the *old* mode and still works, but for the
   new central/secondary topology the **central** should be run in central-only mode:

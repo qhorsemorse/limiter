@@ -24,11 +24,10 @@ import argparse, json, os, re, subprocess, threading, time, signal, sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-import db as DB, store as ST, dns as DNS, engine as E, bypass as B, doh as DOH, workout as W
+import db as DB, store as ST, dns as DNS, engine as E, bypass as B, doh as DOH, workout as W, work as WK
 
 _workout = None
 _workout_lock = threading.Lock()
-
 def get_workout():
     global _workout
     if _workout is None:
@@ -38,6 +37,27 @@ def get_workout():
                     os.environ.get("WORKOUT_FILE")
                     or os.path.join(BASE, "data", "workout.json"))
     return _workout
+
+_work = None
+_work_lock = threading.Lock()
+def get_work():
+    global _work
+    if _work is None:
+        with _work_lock:
+            if _work is None:
+                _work = WK.Work(
+                    os.environ.get("WORK_FILE")
+                    or os.path.join(BASE, "data", "work.json"))
+    return _work
+
+def _sync_work_store():
+    """Push the Work state machine's block-eom-thing window into the store so
+    resolve_bytes blocks (or un-blocks) everything for the duration. Called
+    after every mutating /api/work action."""
+    try:
+        get_store().set_work_until(get_work().status().get("work_until_ms", 0))
+    except Exception:
+        pass
 
 HTML = open(os.path.join(BASE, "index.html"), "r", encoding="utf-8").read()
 DB_PATH = os.environ.get("LIMITS_DB", os.path.join(BASE, "data", "limits.db"))
@@ -108,6 +128,13 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send(500, {"error": str(e)})
             return
+        if path == "/work.html":
+            try:
+                with open(os.path.join(BASE, "work.html"), "r", encoding="utf-8") as f:
+                    self._send(200, f.read(), "text/html; charset=utf-8")
+            except Exception as e:
+                self._send(500, {"error": str(e)})
+            return
         if path == "/":
             self._send(200, HTML, "text/html; charset=utf-8")
             return
@@ -137,6 +164,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/workout":
             self._send(200, get_workout().status())
+            return
+        if path == "/api/work":
+            self._send(200, get_work().status())
             return
         self._send(404, {"error": "not found"})
 
@@ -214,6 +244,43 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(400, {"error": err, **st})
                 return self._send(200, st)
             return self._send(400, {"error": "unknown action (use start|tick|redeem|set_duration)"})
+        if path == "/api/work":
+            try:
+                length = int(self.headers.get("Content-Length", 0) or 0)
+                raw = self.rfile.read(length) if length else b""
+                rec = json.loads(raw.decode() or "{}")
+                action = rec.get("action")
+            except Exception:
+                return self._send(400, {"error": "invalid json"})
+            w = get_work()
+            st = w.status()
+            if action == "add_card":
+                st = w.add_card(rec.get("name"), rec.get("kind"))
+            elif action == "remove_card":
+                st = w.remove_card(rec.get("cid"))
+            elif action == "set_budget":
+                st = w.set_budget(rec.get("ms"))
+            elif action == "set_limit":
+                st = w.set_limit(rec.get("ms"))
+            elif action == "set_penalty":
+                st = w.set_penalty(rec.get("ms"))
+            elif action == "set_active_card":
+                st = w.set_active_card(rec.get("cid"))
+            elif action == "start":
+                st = w.start()
+            elif action == "pause":
+                st = w.pause()
+            elif action == "resume":
+                st = w.resume()
+            elif action == "tick":
+                st, err = w.tick(rec.get("delta_ms", 0))
+                if err:
+                    return self._send(400, {"error": err, **st})
+            else:
+                return self._send(400, {"error": "unknown action"})
+            # keep the store's block-eom-thing window in sync with the session
+            _sync_work_store()
+            return self._send(200, st)
         self._send(404, {"error": "not found"})
 
     def do_DELETE(self):
@@ -369,6 +436,17 @@ def main():
                       + time.strftime("%H:%M:%S", time.localtime(_wst["reward_until_ms"] / 1000.0)))
     except Exception as e:
         print("[!] workout restore failed:", e)
+    # Restore an in-progress/pungished work focus window across restarts (the
+    # block-eom-thing window itself lives in data/work.json; the in-memory flag
+    # does not, and without this a restart mid-session would un-block everything).
+    try:
+        _wku = get_work().status().get("work_until_ms", 0) or 0
+        if _wku:
+            store.set_work_until(_wku)
+            print("[+] work focus/penalty block restored until "
+                  + time.strftime("%H:%M:%S", time.localtime(_wku / 1000.0)))
+    except Exception as e:
+        print("[!] work restore failed:", e)
     threading.Thread(target=ticker, args=(store,), daemon=True).start()
 
     # --- (root) iptables layer: only runs when explicitly requested ---
