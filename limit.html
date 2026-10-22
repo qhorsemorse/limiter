@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Limit details</title>
+<style>
+  :root{color-scheme:light}
+  body{font-family:system-ui,sans-serif;margin:0;padding:24px;background:#f4f6fb;color:#1b1b1b}
+  h1{font-size:22px;margin:0 0 4px}
+  .sub{color:#666;margin:0 0 20px;font-size:13px}
+  .card{background:#fff;border:1px solid #e0e0e0;border-radius:10px;padding:18px;box-shadow:0 1px 3px rgba(0,0,0,.05);max-width:520px}
+  .card h2{margin:0 0 2px;font-size:18px}
+  .tag{display:inline-block;font-size:11px;padding:2px 8px;border-radius:10px;margin-left:8px;vertical-align:middle}
+  .t-abs{background:#ffecec;color:#c42}
+  .t-time{background:#e6f0fc;color:#269}
+  .row{display:flex;justify-content:space-between;gap:12px;padding:5px 0;border-bottom:1px solid #f0f0f0;font-size:13px}
+  .row .k{color:#777}
+  .doms{color:#222;font-size:13px;margin:8px 0;word-break:break-word;line-height:1.7}
+  .state{font-weight:600}
+  .st-blocked{color:#c42}
+  .st-free{color:#2a8}
+  .count{font-family:mono;font-size:20px;margin:6px 0}
+  .lim{color:#777;font-size:12px}
+  form{background:#fff;border:1px solid #e0e0e0;border-radius:10px;padding:18px;margin-top:16px;max-width:520px}
+  label{display:block;font-size:13px;margin:10px 0 3px;color:#333}
+  input,select{width:100%;padding:7px;border:1px solid #ccc;border-radius:6px;box-sizing:border-box}
+  button{margin-top:14px;padding:9px 16px;background:#2b6289;color:#fff;border:none;border-radius:6px;cursor:pointer}
+  .err{color:#c42;margin-top:8px;font-size:13px;min-height:16px}
+  .ok{color:#2a8;margin-top:8px;font-size:13px;min-height:16px}
+  .topnav{max-width:560px;margin:0 0 18px;padding:6px;background:#fff;
+         border:1px solid #e0e0e0;border-radius:10px;box-shadow:0 1px 3px rgba(0,0,0,.05);
+         display:flex;gap:16px}
+  .topnav a{padding:8px 16px;border-radius:6px;text-decoration:none;font-weight:600;color:#445;background:transparent}
+  .topnav a:hover{background:#eef1f5}
+  .topnav a.active{background:#2b6289;color:#fff}
+  .back{display:inline-block;margin-top:16px;font-size:13px;color:#2b6289;text-decoration:none}
+  .warn{background:#fff8e6;border:1px solid #f0c3;border-radius:8px;padding:10px 12px;margin-top:14px;font-size:12px;color:#a7890;max-width:520px}
+  .empty{color:#999;font-style:italic}
+</style>
+</head>
+<body>
+  <nav class="topnav">
+    <a href="/">Home</a>
+    <a href="workout.html">Workout</a>
+    <a href="work.html">Work</a>
+  </nav>
+  <h1>Limit details</h1>
+  <p class="sub">View and ADD domains to this limit. Added domains can only ever be removed by hand-editing the gateway's internal settings file.</p>
+
+  <div id="detail" class="card">Loading…</div>
+
+  <form id="addform">
+    <label>Add domains (comma separated)</label>
+    <input name="domains" placeholder="new1.com, sub.new2.org" required>
+    <button type="submit">Add domains</button>
+    <div class="err" id="err"></div>
+    <div class="ok" id="ok"></div>
+  </form>
+
+  <div class="warn">
+    <strong>Add-only:</strong> once a domain is added it stays in this limit — there is
+    no remove button. Use it for lists you want to keep permanent (e.g. a fixed set of
+    blocked sites). Undoing a domain needs a manual edit of the gateway's storage.
+  </div>
+
+  <a class="back" href="/">&larr; Back to all limits</a>
+
+<script>
+const $ = s => document.querySelector(s);
+const pathParts = window.location.pathname.split("/").filter(Boolean); // e.g. ["limit","5"]
+const limitId = pathParts[1] ? parseInt(pathParts[1], 10) : NaN;
+
+function fmt(ms){
+  ms = Math.max(0, Math.round(ms/1000));
+  const h = String(Math.floor(ms/3600)).padStart(2,"0");
+  const m = String(Math.floor((ms%3600)/60)).padStart(2,"0");
+  const s = String(ms%60).padStart(2,"0");
+  return h+":"+m+":"+s;
+}
+
+async function load(){
+  const el = $("#detail");
+  let l;
+  try {
+    const r = await fetch("/api/limits/"+limitId);
+    if(!r.ok){ el.innerHTML = "<h2>Limit not found</h2>"; return; }
+    l = await r.json();
+  } catch(e){ el.innerHTML = "<h2>Could not load limit</h2><p class='lim'>"+e.message+"</p>"; return; }
+
+  const tag = l.type==="absolute"
+    ? '<span class="tag t-abs">ABSOLUTE</span>'
+    : '<span class="tag t-time">TIME</span>';
+
+  let info = "";
+  if(l.type==="absolute"){
+    info = `
+      <div class="row"><span class="k">Type</span><span>Always blocked (absolute)</span></div>`;
+  } else {
+    let st, cls;
+    if(l.state==="free"){
+      if(l.grace_until!=null){ st="In freedom → blocked in"; cls="st-free"; }
+      else { st="Free — access to start timer"; cls="st-free"; }
+    } else {
+      if(l.cooldown_until!=null){ st="Blocked → free in"; cls="st-blocked"; }
+      else { st="Blocked"; cls="st-blocked"; }
+    }
+    info = `
+      <div class="row"><span class="k">Type</span><span>Time (grace then block)</span></div>
+      <div class="row"><span class="k">State</span><span class="state ${cls}">${st}</span></div>
+      ${l.grace_until!=null ? `<div class="row"><span class="k">Freedom left</span><span class="count">${fmt(l.grace_until - Date.now())}</span></div>` : ""}
+      ${l.cooldown_until!=null ? `<div class="row"><span class="k">Blocked left</span><span class="count">${fmt(l.cooldown_until - Date.now())}</span></div>` : ""}
+      <div class="row"><span class="k">Grace</span><span>${Math.round(l.grace_ms/60000)} min</span></div>
+      <div class="row"><span class="k">Cooldown</span><span>${Math.round(l.cooldown_ms/60000)} min</span></div>`;
+  }
+
+  const doms = l.domains || [];
+  const domsHtml = doms.length
+    ? doms.map(d => `<code>${d}</code>`).join("  ·  ")
+    : "<span class='empty'>no domains</span>";
+
+  el.innerHTML = `
+    <h2>${l.name || "(untitled)"} ${tag}</h2>
+    <div class="lim">id ${l.id} · domains ${doms.length} · updated ${(l.updated_at||"").slice(0,19).replace("T"," ")}</div>
+    ${info}
+    <div class="doms">${domsHtml}</div>`;
+}
+
+async function addDomains(e){
+  e.preventDefault();
+  const f = e.target;
+  const domains = f.domains.value.split(",").map(s=>s.trim()).filter(Boolean);
+  $("#err").textContent=""; $("#ok").textContent="";
+  try{
+    const r = await fetch("/api/limits/"+limitId+"/domains",{
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({domains})
+    });
+    const j = await r.json();
+    if(!r.ok){ $("#err").textContent = j.error || ("HTTP "+r.status); return; }
+    $("#ok").textContent = j.added > 0
+      ? `Added ${j.added} new domain${j.added>1?"s":""} (deduped). Total now: ${j.limit.domains.length}.`
+      : "All domains already present — nothing added (add-only).";
+    f.reset();
+    load();
+  }catch(err){ $("#err").textContent = "Request failed: "+err.message; }
+}
+$("#addform").addEventListener("submit", addDomains);
+
+if(!isNaN(limitId)){ load(); setInterval(load, 1000); }
+else { $("#detail").innerHTML = "<h2>No limit id</h2>"; }
+</script>
+</body>
+</html>

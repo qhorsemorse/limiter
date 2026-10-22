@@ -10,7 +10,8 @@
   h1{font-size:22px;margin:0 0 4px}
   .sub{color:#666;margin:0 0 20px;font-size:13px}
   .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:16px}
-  .card{background:#fff;border:1px solid #e0e0e0;border-radius:10px;padding:16px;box-shadow:0 1px 3px rgba(0,0,0,.05)}
+  .card{background:#fff;border:1px solid #e0e0e0;border-radius:10px;padding:16px;box-shadow:0 1px 3px rgba(0,0,0,.05);cursor:pointer}
+  .card:hover{box-shadow:0 2px 8px rgba(43,98,137,.18)}
   .card h2{margin:0 0 2px;font-size:16px}
   .tag{display:inline-block;font-size:11px;padding:2px 8px;border-radius:10px;margin-left:8px;vertical-align:middle}
   .t-abs{background:#ffecec;color:#c42}
@@ -139,6 +140,13 @@ function render(l, now){
   }
   card.innerHTML = `<h2>${l.name||"(untitled)"} ${tag}</h2>
     <div class="doms">${(l.domains||[]).join(", ")}</div>${body}`;
+  const hint = document.createElement("div");
+  hint.className="lim"; hint.style.marginTop="8px"; hint.style.color="#2b6289";
+  hint.textContent = "View & edit →";
+  card.appendChild(hint);
+  // click the card -> dedicated per-limit page (add domains, view conditions)
+  const lid = l.id;
+  card.onclick = () => { location.href = "/limit/" + lid; };
   return card;
 }
 

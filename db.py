@@ -46,6 +46,31 @@ def delete_limit(con, lid):
     con.commit()
     return cur.rowcount
 
+def append_domains_to_limit(con, lid, domains, now=None):
+    """Append `domains` (a list of already-normalized hostnames) to limit `lid`,
+    deduping against the limit's existing domains and against each other. A domain
+    that is already present is left exactly where it is -- it can NEVER be moved or
+    removed. Returns the number of NEW domains added (0 means everything was
+    already there).
+
+    This is the one-directional (add-only) part of the per-limit flow: there is no
+    code path that ever removes a domain from a limit. Undoing an add is only
+    possible by hand-editing this (hidden) DB."""
+    row = con.execute("SELECT domains FROM limits WHERE id=?", (lid,)).fetchone()
+    if row is None:
+        return None                     # limit vanished (shouldn't happen via API)
+    existing = json.loads(row[0] or "[]")
+    existing_ids = set(existing)
+    added = [d for d in domains if d not in existing_ids]
+    if added:
+        existing.extend(added)
+        if now is None:
+            now = time.time()
+        con.execute("UPDATE limits SET domains=?, updated_at=? WHERE id=?",
+                    (json.dumps(existing), now, lid))
+        con.commit()
+    return len(added)
+
 def get_limit(con, lid):
     row = con.execute("SELECT * FROM limits WHERE id=?", (lid,)).fetchone()
     return _row_to_dict(row) if row else None

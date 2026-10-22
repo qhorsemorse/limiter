@@ -148,7 +148,7 @@ curl -s --cacert /home/pietro/limiter/certs/ca.pem -H 'Content-Type: application
 | `bypass.py` | Bypass detection (VPN peers, public-DoH sockets, Firefox process/sockets, lock-file check) + optional iptables rules (used only with `--bypass-protect`) |
 | `workout.py` | Daily workout/reward state machine (calendar-day rollover, wall-clock-capped credit, 25-min floor, √x·ln(x)·0.9 reward) |
 | `work.py` | Daily *focus-session* state machine (button start/pause/resume timer, common min across cards, monotonic min, penalty on failure, block-e window) |
-| `db.py` | sqlite schema/helpers |
+| `db.py` | sqlite schema/helpers (`limits` table incl. one-directional add-only domain append) |
 | `index.html` | page 1 — limits + bypass override (Home nav button) |
 | `workout.html` | page 2 — daily workout card (Workout nav button) |
 | `work.html` | page 3 — daily work focus session (Work nav button): cards, common min, timer, start/pause/resume, penalty |
@@ -162,7 +162,8 @@ curl -s --cacert /home/pietro/limiter/certs/ca.pem -H 'Content-Type: application
 | `test_secondary.py` | **NEW** — end-to-end: central(central-only) + stub upstream + secondary driving real DoH wire queries (blocked/forwarded, detect arms grace centrally) |
 | `test_work.py` | Work/focus-session feature tests (unit for the state machine + live end-to-end: work session blocks every domain through the real resolver, penalty window, un-block on completion) |
 | `tools/` | Setup & maintenance scripts (see §5) — incl. `limiter-central.service` + `install_central.sh` |
-| `test_*.py` | 8 test suites (engine, dns, doh, app, bypass, remote_store, secondary, work) — plain `python3 test_x.py` |
+| `test_limit.py` | Per-limit, one-directional (add-only) domain management: unit (`Store.add_domains`) + live HTTP integration (create/append/dedup + the guarantee that no delete/remove-domain endpoint exists) |
+| `test_*.py` | 9 test suites (engine, dns, doh, app, bypass, remote_store, secondary, work, limit) — plain `python3 test_x.py` |
 | `certs/` | Self-signed CA + server cert for the DoH endpoint |
 | `data/` | Runtime state: `limits.db`, `workout.json`, `gateway.log`, pidfile, `browsers_locked.txt` |
 | `HANDOFF_CONTEXT.md` | Detailed state notes (architecture, gotchas, session history) |
@@ -298,6 +299,8 @@ State files: `data/limits.db` (limits), `data/workout.json` (daily workout/rewar
 (nohup-run logs; under systemd the log is the journal: `journalctl --user -u limiter`).
 
 API (JSON): `GET /api/limits`, `POST /api/limits`, `DELETE /api/limits/<id>`,
+`GET /api/limits/<id>` (single limit — feeds /limit/<id>),
+`POST /api/limits/<id>/domains {domains:[...]}` (ADD domains only — one-directional, see §7),
 `GET /api/bypass`, `POST /api/bypass/override {enabled}`, `GET /api/stats`,
 `GET /api/workout`, `POST /api/workout {action: start|tick|redeem|set_duration {ms}}`,
 `GET /api/work`, `POST /api/work {action: add_card|remove_card|set_budget|set_limit|set_active_card|start|pause|resume|tick}`, `GET /api/health`.
@@ -325,6 +328,11 @@ API (JSON): `GET /api/limits`, `POST /api/limits`, `DELETE /api/limits/<id>`,
   `√x·ln(x)·0.9` min (x = chosen workout minutes); same-day only,
   non-stackable, earned only on full completion, restored across gateway
   restarts while active.
+* **Limit domains are one-directional (add-only):** `POST /api/limits/<id>/domains`
+  appends domains to a limit, but there is no endpoint to remove a domain once added.
+  Undoing an add is only possible by hand-editing the hidden `data/limits.db`
+  (WAL-mode, outside the web root) — treat added domains as permanent.
+
 * Headless snap Firefox cannot be used to *validate* DoH in this environment
   (broken DNS path in headless mode) — validate in the real browser.
 
@@ -332,10 +340,10 @@ API (JSON): `GET /api/limits`, `POST /api/limits`, `DELETE /api/limits/<id>`,
 
 ```bash
 systemctl --user stop limiter        # :5354 must be free for the stub upstreams
-for t in test_engine test_dns test_doh test_app test_bypass test_remote_store test_secondary test_work; do python3 $t.py; done
+for t in test_engine test_dns test_doh test_app test_bypass test_remote_store test_work test_limit; do python3 $t.py; done
 systemctl --user start limiter
 ```
-All eight suites are self-contained (throwaway sqlite in /tmp, fake upstreams).
+All nine suites are self-contained (throwaway sqlite in /tmp, fake upstreams).
 `test_secondary` and `test_remote_store` also stand up a **central-only** `app.py`
 (and a stub upstream) in-process; they clean up after themselves. `test_remote_store`
 kills any stray process already bound to its ports before launching. `test_bypass.py`
@@ -349,7 +357,13 @@ security alarm).
 
 ## 9. Machine state at handoff (2026-10-16 — after central/secondary rearch)
 
-* **All 8 test suites green.** Nothing in the original single-host engine regressed.
+* **All 9 test suites green.** Nothing in the original single-host engine regressed.
+  The **per-limit domain-management** feature (click a limit → dedicated page
+  `limit.html` at `/limit/<id>`; see the detail page for the limit's type /
+  conditions / domains and an *add domains* control) is implemented and tested
+  (`test_limit.py`). It is wired via `db.append_domains_to_limit` + `Store.add_domains`,
+  and is one-directional: `POST /api/limits/<id>/domains` only appends — there is no
+  remove/delete-domain endpoint, so undoing an add needs a hand-edit of the hidden DB.
 * **Work / focus-session feature is implemented and tested** (new `work.py`, `work.html`, `test_work.py`; wired into `app.py` and `secondary.py` via a new block-e window on the store). A session blocks every domain through the real resolver, the minimum is monotonic, and a failed session arms a penalty window. See README §1 + the `work.py` module doc.
 * Single-host `limiter.service` still **running** (systemd --user, lingering → auto
   at boot) on :8443/:5354/:8080. This is the *old* mode and still works, but for the

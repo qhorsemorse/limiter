@@ -6,6 +6,11 @@ Serves:
   GET  /api/limits         -> JSON list of limits (+ live state)
   POST /api/limits         -> add a limit  (body: {"name","type","domains",grace?,cooldown?})
   DELETE /api/limits/<id>  -> delete a limit (admin)
+  GET  /api/limits/<id>    -> JSON for a single limit (feeds the detail page)
+  POST /api/limits/<id>/domains -> ADD domains to a limit (body: {"domains":[...]})
+      one-directional: a domain can only ever be ADDED to a limit; there is no
+      remove/delete-domain endpoint anywhere -> undoing is only possible by
+      hand-editing the hidden DB. (no reverse-flow API by design)
   POST /api/detect         -> secondary reports a domain was reached (arms the
       central grace timer once); returns affected limits (authoritative state)
   GET  /api/bypass         -> live bypass detection (VPN / public DoH / browser state)
@@ -135,6 +140,16 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send(500, {"error": str(e)})
             return
+        m = re.match(r"^/limit/(\d+)$", path)
+        if m:
+            # per-limit detail page (the id is in the path; the page fetches
+            # /api/limits/<id> itself and shows a "not found" for a bad id)
+            try:
+                with open(os.path.join(BASE, "limit.html"), "r", encoding="utf-8") as f:
+                    self._send(200, f.read(), "text/html; charset=utf-8")
+            except Exception as e:
+                self._send(500, {"error": str(e)})
+            return
         if path == "/":
             self._send(200, HTML, "text/html; charset=utf-8")
             return
@@ -154,6 +169,20 @@ class Handler(BaseHTTPRequestHandler):
                     "updated_at": l.get("updated_at") or l.get("created_at"),
                 })
             self._send(200, limits)
+            return
+        m = re.match(r"^/api/limits/(\d+)$", path)
+        if m:
+            lim = get_store().get_limit(int(m.group(1)))
+            if not lim:
+                return self._send(404, {"error": "limit not found"})
+            self._send(200, {
+                "id": lim["id"], "name": lim["name"], "type": lim["type"],
+                "domains": lim["domains"], "grace_ms": lim.get("grace_ms"),
+                "cooldown_ms": lim.get("cooldown_ms"), "state": lim["state"],
+                "grace_until": lim.get("grace_until"),
+                "cooldown_until": lim.get("cooldown_until"),
+                "updated_at": lim.get("updated_at") or lim.get("created_at"),
+            })
             return
         if path == "/api/bypass":
             self._send(200, get_view_bypass())
@@ -207,6 +236,27 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(500, {"error": "db error: " + str(e)})
             self._send(201, {k: new[k] for k in ("id", "name", "type", "domains",
                         "grace_ms", "cooldown_ms", "state")})
+            return
+        m = re.match(r"^/api/limits/(\d+)/domains$", path)
+        if m:
+            try:
+                length = int(self.headers.get("Content-Length", 0) or 0)
+                raw = self.rfile.read(length) if length else b""
+                rec = json.loads(raw.decode() or "{}")
+            except Exception as e:
+                return self._send(400, {"error": "invalid json: " + str(e)})
+            # ONE-DIRECTIONAL: append domains to a limit. There is no endpoint that
+            # removes a domain from a limit -> adding is the only mutation of the
+            # domain set, and undoing it needs hand-editing the hidden DB.
+            try:
+                lim, added = get_store().add_domains(int(m.group(1)), rec.get("domains", []))
+            except KeyError:
+                return self._send(404, {"error": "limit not found"})
+            except ValueError as e:
+                return self._send(400, {"error": str(e)})
+            except Exception as e:
+                return self._send(500, {"error": "db error: " + str(e)})
+            self._send(201, {"added": added, "limit": lim})
             return
         if path == "/api/bypass/override":
             try:

@@ -195,12 +195,13 @@ curl -s --cacert /home/pietro/limiter/certs/ca.pem -H 'Content-Type: application
 
 ## 6. TEST IT — IMPORTANT CAUSE
 
-All 7 suites are plain-Python (no pytest), self-contained (throwaway sqlite in /tmp,
-fake upstreams). `test_dns` and `test_app` bind their stub upstream on **:5354**, which
-the *live* gateway also binds — run them with the gateway stopped:
+All 8 suites are plain-Python (no pytest), self-contained (throwaway sqlite in /tmp,
+fake upstreams). `test_dns` and `test_app` (and, for the work feature, `test_work`)
+bind their stub upstream on **:5354**, which the *live* gateway also binds — run them
+with the gateway stopped:
 ```bash
 systemctl --user stop limiter                 # free :5354 (and :8080) for the stubs
-for t in test_engine test_dns test_doh test_app test_bypass test_remote_store test_secondary; do python3 $t.py; done
+for t in test_engine test_dns test_doh test_app test_bypass test_remote_store test_secondary test_work; do python3 $t.py; done
 systemctl --user start limiter                # (or start it however you like)
 ```
 Failure signature NOT to mistake for a bug: `OSError: [Errno 98] Address already in use`
@@ -236,6 +237,17 @@ on `127.0.0.1:5354` means the gateway is still running. `test_bypass.py` still d
 === END HANDOFF PROMPT ===
 
 ## NEXT STEPS (in priority order)
+0. **Per-limit, one-directional (add-only) domain management — DONE (this session).
+   Clicking a limit in the UI opens a dedicated detail page at `/limit/<id>`
+   (`limit.html`) where you can see the limit's type / conditions / current domains
+   and ADD new ones. The mutation path is one-directional: `POST /api/limits/<id>/domains`
+   (via `db.append_domains_to_limit` + `Store.add_domains`) only appends + dedups — there
+   is intentionally NO delete/remove-domain endpoint anywhere, so undoing an add is only
+   possible by hand-editing the hidden `data/limits.db` (WAL-mode, outside the web root),
+   matching the project's "difficult to undo" philosophy. Backend + UI wired into
+   `app.py` (GET /api/limits/<id>, POST /api/limits/<id>/domains, /limit/<id> route),
+   `db.py`, `store.py`, and `index.html` (limit cards are now clickable → detail page);
+   new file `limit.html`. Tested by `test_limit.py`. **All 9 suites green.**
 1. **Work / focus-session feature — DONE (this session).** New `work.py` + `work.html` + `test_work.py`, wired into `app.py` and `secondary.py`, with a store-level block-e window (`work_active`) that the resolver honours. All 8 suites green. Behaviour: a session blocks every domain (time-limit AND absolute) while active, has a button start/pause/resume timer, cards sharing one common monotonic minimum, and arms a penalty window when the timer runs out before the minimum is met. See README §1 + the `work.py` module doc for the exact rules.
 2. **Live end-to-end proof on real hardware.** Everything is proven in-process
    (test_secondary drives real DoH wire queries through the secondary). The one thing
@@ -243,9 +255,9 @@ on `127.0.0.1:5354` means the gateway is still running. `test_bypass.py` still d
    blocked domain still loads, the usual causes: certs missing (DoH off), lock not
    applied on THAT device (Firefox not routing through us → watcher may go nuclear,
    which is still blocking), or upstream forward broken.
-2. **`install_policy.sh` on the user side** (sudo) to lock Firefox's DoH settings
+3. **`install_policy.sh` on the user side** (sudo) to lock Firefox's DoH settings
    read-only on each secondary, so the child can't switch to Cloudflare/Google.
-3. **Optional — whole-OS plain-DNS control** on secondaries (`bypass.py` already
+4. **Optional — whole-OS plain-DNS control** on secondaries (`bypass.py` already
    generates the ruleset; needs root). Treat as dormant.
-4. **Optional polish / refactors** the user is currently reviewing by hand — nothing
+5. **Optional polish / refactors** the user is currently reviewing by hand — nothing
    blocks shipping.

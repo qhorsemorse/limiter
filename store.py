@@ -75,6 +75,27 @@ class Store:
                 self.limits = [l for l in self.limits if l["id"] != lid]
         return bool(n)
 
+    def get_limit(self, lid):
+        """Return the limit dict for `lid`, or None."""
+        with self.lock:
+            lim = DB.get_limit(self.con, lid)
+            return dict(lim) if lim else None
+
+    def add_domains(self, lid, domains):
+        """Append domains to an existing limit. Returns (limit_dict, new_count).
+        One-directional: there is intentionally NO way to remove a domain once it
+        is on a limit -- adding is the only mutation of a limit's domain set.
+        Raises KeyError if the limit is unknown, ValueError on bad input."""
+        with self.lock:
+            if DB.get_limit(self.con, lid) is None:
+                raise KeyError(lid)
+            norm = E.valid_domains(domains or [])
+            if not norm:
+                raise ValueError("at least one valid domain required")
+            n = DB.append_domains_to_limit(self.con, lid, norm)
+            lim = DB.get_limit(self.con, lid)
+            return dict(lim), n
+
     # ---- reads / evaluation ----
     def snapshot(self):
         with self.lock:
