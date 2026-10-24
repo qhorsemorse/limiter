@@ -1,0 +1,29 @@
+[+] secondary DoH front-door on https://127.0.0.1:8444/dns-query
+[+] secondary 'upstream' (real DNS for allowed sites): 127.0.0.53:53
+[+] secondary child UI + API on http://0.0.0.0:5353
+[+] central: http://192.168.0.99:8080 (initial sync online=True emergency=False)
+127.0.0.1 - - [22/Oct/2026 17:51:08] "GET /api/remote/status HTTP/1.1" 200 -
+127.0.0.1 - - [22/Oct/2026 17:51:08] "GET /api/stats HTTP/1.1" 200 -
+127.0.0.1 - - [22/Oct/2026 17:52:50] "GET /api/stats HTTP/1.1" 200 -
+127.0.0.1 - - [22/Oct/2026 18:07:56] "GET /api/stats HTTP/1.1" 200 -
+127.0.0.1 - - [22/Oct/2026 18:14:37] "GET /api/stats HTTP/1.1" 200 -
+127.0.0.1 - - [22/Oct/2026 18:42:41] "GET /api/remote/status HTTP/1.1" 200 -
+127.0.0.1 - - [22/Oct/2026 18:42:41] "GET /api/limits HTTP/1.1" 200 -
+[+] secondary shutting down
+Traceback (most recent call last):
+  File "/home/pietro/limiter/run_secondary.py", line 59, in <module>
+    main()
+  File "/home/pietro/limiter/run_secondary.py", line 55, in main
+    secondary.main()
+  File "/home/pietro/limiter/secondary.py", line 316, in main
+    httpd.serve_forever()
+  File "/usr/lib/python3.12/socketserver.py", line 235, in serve_forever
+    ready = selector.select(poll_interval)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/selectors.py", line 415, in select
+    fd_event_list = self._selector.poll(timeout)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/pietro/limiter/secondary.py", line 311, in shutdown
+    doh_httpd.server.shutdown() if doh_httpd else None
+    ^^^^^^^^^^^^^^^^
+AttributeError: 'ThreadingHTTPServer' object has no attribute 'server'
