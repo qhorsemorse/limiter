@@ -212,15 +212,11 @@ class RemoteStore:
             _code, payload = _http_json("POST", url,
                                         {"domain": domain}, timeout=self.http_timeout)
         except Exception:
-            # central unreachable — still refresh our cache best-effort so a
-            # later read is as fresh as possible.
-            self.sync()
+            # central unreachable
             return 0
         affected = payload.get("detected") or []
         for lim in affected:
             self.cache.touch_row(lim)
-        # touch the sync timestamp so staleness reflects this activity
-        self.last_sync_ms = E.now_ms()
         return len(affected)
 
     def _ensure_fresh(self, now=None):
@@ -276,6 +272,21 @@ class RemoteStore:
     def _cached_limits(self):
         return self.cache.get_all()
 
+    def _tick_cached(self, limits, now):
+        for lim in limits:
+            if lim.get("type") != "time":
+                continue
+            if lim.get("state") == "free" and lim.get("grace_until") is not None and now >= lim["grace_until"]:
+                lim["state"] = "blocked"
+                lim["cooldown_until"] = now + lim.get("cooldown_ms", 7200000)
+                lim["grace_until"] = None
+                self.cache.touch_row(lim)
+            elif lim.get("state") == "blocked" and lim.get("cooldown_until") is not None and now >= lim["cooldown_until"]:
+                lim["state"] = "free"
+                lim["grace_until"] = None
+                lim["cooldown_until"] = None
+                self.cache.touch_row(lim)
+
     def evaluate(self, domain):
         """engine.evaluate over the cached (fresh) limits. Offline/emergency
         policy is applied to the not-blocked case."""
@@ -283,6 +294,7 @@ class RemoteStore:
             now = E.now_ms()
             self._ensure_fresh(now)
             limits = self._cached_limits()
+            self._tick_cached(limits, now)
             blocked, lid = E.evaluate(limits, domain)
             if blocked:
                 return True, lid
@@ -300,6 +312,17 @@ class RemoteStore:
         now = now if now is not None else E.now_ms()
         with self.lock:
             self._ensure_fresh(now)
+            # Only report to central if the domain matches a free, un-armed time limit
+            limits = self._cached_limits()
+            self._tick_cached(limits, now)
+            needs_report = False
+            for l in limits:
+                if (l.get("type") == "time" and E.covers(l, domain)
+                        and l.get("state") == "free" and l.get("grace_until") is None):
+                    needs_report = True
+                    break
+            if not needs_report:
+                return 0
             return self.report_access(domain)
 
     def tick(self, now=None):
@@ -308,6 +331,8 @@ class RemoteStore:
         now = now if now is not None else E.now_ms()
         with self.lock:
             self._ensure_fresh(now)
+            limits = self._cached_limits()
+            self._tick_cached(limits, now)
             return self
 
     def count(self, channel, blocked):

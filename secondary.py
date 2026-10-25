@@ -308,7 +308,7 @@ def main():
 
     def shutdown(signum, frame=None):
         print("[+] secondary shutting down")
-        doh_httpd.server.shutdown() if doh_httpd else None
+        doh_httpd.shutdown() if doh_httpd else None
         sys.exit(0)
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)

@@ -87,8 +87,10 @@ def _domain_matches(pattern, target):
             return True
     return False
 
-def _covers(lim, domain):
+def covers(lim, domain):
     return any(_domain_matches(d, domain) for d in lim.get("domains", []))
+
+_covers = covers
 
 def evaluate(limits, domain):
     """Return (blocked: bool, matched_limit_id_or_None)."""

@@ -94,6 +94,10 @@ class Store:
                 raise ValueError("at least one valid domain required")
             n = DB.append_domains_to_limit(self.con, lid, norm)
             lim = DB.get_limit(self.con, lid)
+            for i, l in enumerate(self.limits):
+                if l["id"] == lid:
+                    self.limits[i] = lim
+                    break
             return dict(lim), n
 
     # ---- reads / evaluation ----
@@ -111,12 +115,11 @@ class Store:
     def tick(self, now=None):
         now = now or E.now_ms()
         with self.lock:
-            # persist timers that just changed
+            E.tick(self.limits, now)
             for l in self.limits:
                 if l["type"] != "time":
                     continue
                 DB.save_state(self.con, l["id"], l["state"], l.get("grace_until"), l.get("cooldown_until"))
-            E.tick(self.limits, now)
 
     def detect(self, domain, now=None):
         """Record that `domain` was reached; arm any matching free time-limit."""
@@ -124,7 +127,7 @@ class Store:
         with self.lock:
             hit = False
             for l in self.limits:
-                if l["type"] == "time" and domain in l["domains"] and l["state"] == "free" and l.get("grace_until") is None:
+                if l["type"] == "time" and E.covers(l, domain) and l["state"] == "free" and l.get("grace_until") is None:
                     E.detect_access(l, now)
                     hit = True
             if hit:
@@ -149,7 +152,7 @@ class Store:
         with self.lock:
             hit = False
             for l in self.limits:
-                if (l["type"] == "time" and domain in l["domains"]
+                if (l["type"] == "time" and E.covers(l, domain)
                         and l["state"] == "free" and l.get("grace_until") is None):
                     E.detect_access(l, now)
                     DB.save_state(self.con, l["id"], l["state"],

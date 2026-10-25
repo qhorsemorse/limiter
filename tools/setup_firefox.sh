@@ -46,6 +46,8 @@ block = "\n".join([
     'user_pref("network.trr.wait-for-confirmation", false);',
     'user_pref("network.trr.fallback-on-zero-response", false);',
     'user_pref("network.trr.allow-rfc1918", true);',
+    'user_pref("network.dnsCacheExpiration", 10);',
+    'user_pref("network.dnsCacheExpirationGracePeriod", 0);',
     END, "",
 ])
 txt = open(path).read() if os.path.exists(path) else ""

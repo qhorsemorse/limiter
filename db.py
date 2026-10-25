@@ -95,6 +95,6 @@ def _row_to_dict(row):
     cols = row.keys if hasattr(row, "keys") else range(len(row))
     d = dict(zip(row.keys, row)) if hasattr(row, "keys") else dict(zip(
         ["id","name","type","domains","grace_ms","cooldown_ms",
-         "state","grace_until","cooldown_until","created_at"], row))
+         "state","grace_until","cooldown_until","created_at","updated_at"], row))
     d["domains"] = json.loads(d.get("domains","[]") or "[]")
     return d
