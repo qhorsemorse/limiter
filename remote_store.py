@@ -170,6 +170,7 @@ class RemoteStore:
         self.reward_until = 0.0
         self.work_until = 0.0           # ms; work focus/penalty window (block everything)
         self.stats = {"udp": [0, 0], "doh": [0, 0]}
+        self.limit_ips = {}             # limit_id -> set of resolved IP strings
 
         # connectivity / freshness state
         self.online = False
@@ -180,6 +181,49 @@ class RemoteStore:
             self.sync()  # prime the cache at construction
 
     # ---------------- connectivity ----------------
+    def kill_limit_sockets(self, lim):
+        """Sever established TCP connections to the limit's resolved IPs so
+        browsers (Firefox HTTP/2 persistent connections) are immediately kicked off
+        instead of continuing over open keep-alive sockets."""
+        lid = lim.get("id")
+        ips = set(self.limit_ips.get(lid, set()))
+        for d in lim.get("domains", []):
+            try:
+                for res in socket.getaddrinfo(d, 443, socket.AF_INET):
+                    ips.add(res[4][0])
+            except Exception:
+                pass
+        if ips:
+            kill_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools", "kill_sockets.sh")
+            if os.path.exists(kill_script):
+                try:
+                    import subprocess
+                    subprocess.run(["sudo", "-n", kill_script, *list(ips)],
+                                   timeout=2.0, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                except Exception:
+                    pass
+
+    def record_answers(self, resp_bytes):
+        """Track resolved IPs for limits during the free period so we can sever
+        their TCP connections the instant the limit expires."""
+        if not resp_bytes or len(resp_bytes) < 12:
+            return
+        import doh as DOH
+        try:
+            answers = DOH.extract_answers(resp_bytes)
+            limits = self._cached_limits()
+            for name, qtype, _ttl, rdata in answers:
+                if qtype == 1 and len(rdata) == 4:
+                    ip = socket.inet_ntoa(rdata)
+                    for lim in limits:
+                        if E.covers(lim, name):
+                            lid = lim["id"]
+                            if lid not in self.limit_ips:
+                                self.limit_ips[lid] = set()
+                            self.limit_ips[lid].add(ip)
+        except Exception:
+            pass
+
     def sync(self):
         """Fetch the full limits table from the central and replace the local
         cache. Returns True on success, False if the central was unreachable
@@ -196,10 +240,14 @@ class RemoteStore:
                 self.online = False
                 self.emergency = True
                 return False
+            prev = {l["id"]: l.get("state") for l in self.cache.get_all()}
             loaded = self.cache.replace_all(payload)
             self.last_sync_ms = E.now_ms()
             self.online = True
             self.emergency = False
+            for lim in payload:
+                if lim.get("type") == "time" and lim.get("state") == "blocked" and prev.get(lim["id"]) != "blocked":
+                    self.kill_limit_sockets(lim)
             return True
 
     def report_access(self, domain):
@@ -281,6 +329,7 @@ class RemoteStore:
                 lim["cooldown_until"] = now + lim.get("cooldown_ms", 7200000)
                 lim["grace_until"] = None
                 self.cache.touch_row(lim)
+                self.kill_limit_sockets(lim)
             elif lim.get("state") == "blocked" and lim.get("cooldown_until") is not None and now >= lim["cooldown_until"]:
                 lim["state"] = "free"
                 lim["grace_until"] = None

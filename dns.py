@@ -143,8 +143,12 @@ def resolve_bytes(store, data, upstream, channel="udp", now=None):
         resp = forward(upstream, data)
         if resp:
             store.count(channel, False)
+            if hasattr(store, "record_answers"):
+                store.record_answers(resp)
+            print(f"[{channel}] ALLOW {host} (qtype {qtype})", flush=True)
             return resp, False
     store.count(channel, True)
+    print(f"[{channel}] BLOCK {host} (limit {blocked_id})", flush=True)
     return build_blocked(tid, questions), True
 
 
