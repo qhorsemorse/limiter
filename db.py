@@ -28,15 +28,19 @@ def init_db(path=DEFAULT_DB):
         con.execute("ALTER TABLE limits ADD COLUMN updated_at REAL")
         for row in con.execute("SELECT id, created_at FROM limits"):
             con.execute("UPDATE limits SET updated_at=? WHERE id=?", (row[1], row[0]))
+    if "block_domains" not in cols:
+        con.execute("ALTER TABLE limits ADD COLUMN block_domains TEXT")
     con.commit()
     return con
 
 def add_limit(con, rec):
     now = time.time()
     c = con.execute(
-        "INSERT INTO limits(name,type,domains,grace_ms,cooldown_ms,state,grace_until,cooldown_until,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO limits(name,type,domains,grace_ms,cooldown_ms,state,grace_until,cooldown_until,created_at,updated_at,block_domains) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
         (rec.get("name",""), rec["type"], json.dumps(rec["domains"]),
-         rec.get("grace_ms"), rec.get("cooldown_ms"), "free", None, None, now, now),
+         rec.get("grace_ms"), rec.get("cooldown_ms"), "free", None, None, now, now,
+         json.dumps(rec.get("block_domains", []) or [])),
     )
     con.commit()
     return c.lastrowid
@@ -71,6 +75,28 @@ def append_domains_to_limit(con, lid, domains, now=None):
         con.commit()
     return len(added)
 
+def append_block_domains_to_limit(con, lid, domains, now=None):
+    """Append block-only domains (already-normalized hostnames) to limit `lid`,
+    deduped against the limit's existing block_domains and against each other.
+    Like append_domains_to_limit this is one-directional (add-only): there is no
+    code path that removes a block domain once added.
+    Returns the number of NEW domains added (0 means every one was already there).
+    Returns None if the limit is unknown."""
+    row = con.execute("SELECT block_domains FROM limits WHERE id=?", (lid,)).fetchone()
+    if row is None:
+        return None
+    existing = json.loads(row[0] or "[]")
+    existing_ids = set(existing)
+    added = [d for d in domains if d not in existing_ids]
+    if added:
+        existing.extend(added)
+        if now is None:
+            now = time.time()
+        con.execute("UPDATE limits SET block_domains=?, updated_at=? WHERE id=?",
+                    (json.dumps(existing), now, lid))
+        con.commit()
+    return len(added)
+
 def get_limit(con, lid):
     row = con.execute("SELECT * FROM limits WHERE id=?", (lid,)).fetchone()
     return _row_to_dict(row) if row else None
@@ -95,6 +121,7 @@ def _row_to_dict(row):
     cols = row.keys if hasattr(row, "keys") else range(len(row))
     d = dict(zip(row.keys, row)) if hasattr(row, "keys") else dict(zip(
         ["id","name","type","domains","grace_ms","cooldown_ms",
-         "state","grace_until","cooldown_until","created_at","updated_at"], row))
+         "state","grace_until","cooldown_until","created_at","updated_at","block_domains"], row))
     d["domains"] = json.loads(d.get("domains","[]") or "[]")
+    d["block_domains"] = json.loads(d.get("block_domains","[]") or "[]")
     return d

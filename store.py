@@ -61,6 +61,7 @@ class Store:
                 "name": rec.get("name",""),
                 "type": rec["type"],
                 "domains": E.valid_domains(rec.get("domains", [])),
+                "block_domains": E.valid_domains(rec.get("block_domains", [])),
                 "grace_ms": E._ms(rec.get("grace_min", 40)) if "grace_min" in rec else int(rec.get("grace_ms", 2_400_000)),
                 "cooldown_ms": E._ms(rec.get("cooldown_min", 120)) if "cooldown_min" in rec else int(rec.get("cooldown_ms", 7_200_000)),
             })
@@ -74,6 +75,24 @@ class Store:
             if n:
                 self.limits = [l for l in self.limits if l["id"] != lid]
         return bool(n)
+
+    def add_block_domains(self, lid, domains):
+        """Append block-only domains to an existing limit. Returns (limit_dict, new_count).
+        One-directional (there is intentionally NO way to remove a block domain once it
+        is on a limit). Raises KeyError if the limit is unknown, ValueError on bad input."""
+        with self.lock:
+            if DB.get_limit(self.con, lid) is None:
+                raise KeyError(lid)
+            norm = E.valid_domains(domains or [])
+            if not norm:
+                raise ValueError("at least one valid domain required")
+            n = DB.append_block_domains_to_limit(self.con, lid, norm)
+            lim = DB.get_limit(self.con, lid)
+            for i, l in enumerate(self.limits):
+                if l["id"] == lid:
+                    self.limits[i] = lim
+                    break
+            return dict(lim), n
 
     def get_limit(self, lid):
         """Return the limit dict for `lid`, or None."""

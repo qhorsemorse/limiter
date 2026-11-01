@@ -161,7 +161,9 @@ class Handler(BaseHTTPRequestHandler):
         """Trim the cached limit to what the child view needs."""
         return {
             "id": l.get("id"), "name": l.get("name"), "type": l.get("type"),
-            "domains": l.get("domains", []), "grace_ms": l.get("grace_ms"),
+            "domains": l.get("domains", []),
+            "block_domains": l.get("block_domains", []),
+            "grace_ms": l.get("grace_ms"),
             "cooldown_ms": l.get("cooldown_ms"), "state": l.get("state"),
             "grace_until": l.get("grace_until"), "cooldown_until": l.get("cooldown_until"),
             "updated_at": l.get("updated_at") or l.get("created_at"),

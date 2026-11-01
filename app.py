@@ -161,7 +161,8 @@ class Handler(BaseHTTPRequestHandler):
             for l in get_store().snapshot():
                 limits.append({
                     "id": l["id"], "name": l["name"], "type": l["type"],
-                    "domains": l["domains"], "grace_ms": l.get("grace_ms"),
+                    "domains": l["domains"], "block_domains": l.get("block_domains"),
+                    "grace_ms": l.get("grace_ms"),
                     "cooldown_ms": l.get("cooldown_ms"), "state": l["state"],
                     "grace_until": l.get("grace_until"),
                     "cooldown_until": l.get("cooldown_until"),
@@ -177,7 +178,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(404, {"error": "limit not found"})
             self._send(200, {
                 "id": lim["id"], "name": lim["name"], "type": lim["type"],
-                "domains": lim["domains"], "grace_ms": lim.get("grace_ms"),
+                "domains": lim["domains"], "block_domains": lim.get("block_domains"),
+                "grace_ms": lim.get("grace_ms"),
                 "cooldown_ms": lim.get("cooldown_ms"), "state": lim["state"],
                 "grace_until": lim.get("grace_until"),
                 "cooldown_until": lim.get("cooldown_until"),
@@ -250,6 +252,27 @@ class Handler(BaseHTTPRequestHandler):
             # domain set, and undoing it needs hand-editing the hidden DB.
             try:
                 lim, added = get_store().add_domains(int(m.group(1)), rec.get("domains", []))
+            except KeyError:
+                return self._send(404, {"error": "limit not found"})
+            except ValueError as e:
+                return self._send(400, {"error": str(e)})
+            except Exception as e:
+                return self._send(500, {"error": "db error: " + str(e)})
+            self._send(201, {"added": added, "limit": lim})
+            return
+        # ONE-DIRECTIONAL block-only domains: these get blocked once the limit is
+        # out but NEVER trigger/arm the timer. Undoing an add needs hand-editing
+        # the hidden DB.
+        m = re.match(r"^/api/limits/(\d+)/block_domains$", path)
+        if m:
+            try:
+                length = int(self.headers.get("Content-Length", 0) or 0)
+                raw = self.rfile.read(length) if length else b""
+                rec = json.loads(raw.decode() or "{}")
+            except Exception as e:
+                return self._send(400, {"error": "invalid json: " + str(e)})
+            try:
+                lim, added = get_store().add_block_domains(int(m.group(1)), rec.get("domains", []))
             except KeyError:
                 return self._send(404, {"error": "limit not found"})
             except ValueError as e:

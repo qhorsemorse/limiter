@@ -88,9 +88,20 @@ def _domain_matches(pattern, target):
     return False
 
 def covers(lim, domain):
+    """TRIGGER match: does `domain` belong to this limit's trigger domains?
+    Detection (arming the grace timer) uses this ONLY -- so a domain is said to
+    have been 'reached' (and starts the timer) only if it is a trigger domain."""
     return any(_domain_matches(d, domain) for d in lim.get("domains", []))
 
 _covers = covers
+
+def covers_block(lim, domain):
+    """BLOCKING match: trigger domains OR block-only domains.
+    A domain is *blocked* when the limit is out (state==blocked) if it is either
+    a trigger domain or a block-only domain. block_domains never trigger/arm the
+    timer -- they only get blocked once the limit runs out."""
+    domains = list(lim.get("domains", [])) + list(lim.get("block_domains", []))
+    return any(_domain_matches(d, domain) for d in domains)
 
 def evaluate(limits, domain):
     """Return (blocked: bool, matched_limit_id_or_None)."""
@@ -99,7 +110,7 @@ def evaluate(limits, domain):
         if lim["type"] == "absolute" and _covers(lim, d):
             return True, lim["id"]
     for lim in limits:
-        if lim["type"] == "time" and _covers(lim, d) and lim["state"] == "blocked":
+        if lim["type"] == "time" and covers_block(lim, d) and lim["state"] == "blocked":
             return True, lim["id"]
     return False, None
 

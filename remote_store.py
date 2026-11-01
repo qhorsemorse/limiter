@@ -52,7 +52,8 @@ CREATE TABLE IF NOT EXISTS limits (
     name TEXT, type TEXT, domains TEXT,
     grace_ms INTEGER, cooldown_ms INTEGER,
     state TEXT, grace_until REAL, cooldown_until REAL,
-    created_at REAL, updated_at REAL
+    created_at REAL, updated_at REAL,
+    block_domains TEXT
 )
 """
 
@@ -82,6 +83,12 @@ class CacheDB:
     def __init__(self, path):
         self.con = DB._connect(path)
         self.con.execute(_CACHE_SCHEMA)
+        # Migrate a cache DB that predates block_domains (created before this
+        # column was added). CREATE TABLE IF NOT EXISTS is a no-op on an existing
+        # table, so add any missing columns here to keep the queries happy.
+        cols = {r[1] for r in self.con.execute("PRAGMA table_info(limits)")}
+        if "block_domains" not in cols:
+            self.con.execute("ALTER TABLE limits ADD COLUMN block_domains TEXT")
         self.con.commit()
 
     def replace_all(self, rows):
@@ -92,14 +99,15 @@ class CacheDB:
             self.con.execute("DELETE FROM limits")
             self.con.executemany(
                 "INSERT INTO limits(id,name,type,domains,grace_ms,cooldown_ms,"
-                "state,grace_until,cooldown_until,created_at,updated_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                "state,grace_until,cooldown_until,created_at,updated_at,block_domains) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 [(r["id"], r.get("name", ""), r.get("type", ""),
                   __import__("json").dumps(r.get("domains", [])),
                   r.get("grace_ms"), r.get("cooldown_ms"), r.get("state", "free"),
                   r.get("grace_until"), r.get("cooldown_until"),
                   r.get("updated_at") or r.get("created_at"),
-                  r.get("updated_at") or r.get("created_at")) for r in rows])
+                  r.get("updated_at") or r.get("created_at"),
+                  __import__("json").dumps(r.get("block_domains", []) or [])) for r in rows])
         return len(rows)
 
     def touch_row(self, limit):
@@ -108,10 +116,11 @@ class CacheDB:
         with self.con:
             self.con.execute(
                 "INSERT INTO limits(id,name,type,domains,grace_ms,cooldown_ms,"
-                "state,grace_until,cooldown_until,created_at,updated_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?) "
+                "state,grace_until,cooldown_until,created_at,updated_at,block_domains) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(id) DO UPDATE SET name=excluded.name,type=excluded.type,"
-                "domains=excluded.domains,grace_ms=excluded.grace_ms,"
+                "domains=excluded.domains,block_domains=excluded.block_domains,"
+                "grace_ms=excluded.grace_ms,"
                 "cooldown_ms=excluded.cooldown_ms,state=excluded.state,"
                 "grace_until=excluded.grace_until,cooldown_until=excluded.cooldown_until,"
                 "created_at=COALESCE(excluded.created_at,limits.created_at),"
@@ -121,19 +130,21 @@ class CacheDB:
                  limit.get("grace_ms"), limit.get("cooldown_ms"),
                  limit.get("state", "free"), limit.get("grace_until"),
                  limit.get("cooldown_until"), limit.get("created_at"),
-                 limit.get("updated_at")])
+                 limit.get("updated_at"),
+                 __import__("json").dumps(limit.get("block_domains", []) or [])])
 
     def get_all(self):
         out = []
         for row in self.con.execute(
                 "SELECT id,name,type,domains,grace_ms,cooldown_ms,state,"
-                "grace_until,cooldown_until,created_at,updated_at FROM limits"):
+                "grace_until,cooldown_until,created_at,updated_at,block_domains FROM limits"):
             d = {
                 "id": row[0], "name": row[1], "type": row[2],
                 "domains": json.loads(row[3] or "[]"),
                 "grace_ms": row[4], "cooldown_ms": row[5], "state": row[6],
                 "grace_until": row[7], "cooldown_until": row[8],
                 "created_at": row[9], "updated_at": row[10],
+                "block_domains": json.loads(row[11] or "[]"),
             }
             out.append(d)
         return out
