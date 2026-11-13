@@ -69,7 +69,7 @@ def unit_tests():
 # ---------------------------------------------------------------------------
 # integration tests (live app.py over HTTP)
 # ---------------------------------------------------------------------------
-def http(method, path, body=None, base="http://127.0.0.1:8080"):
+def http(method, path, body=None, base="http://127.0.0.1:8199"):
     url = base + path
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method,
@@ -88,7 +88,7 @@ def integration_tests():
 
     rm(LIM_DB)
     proc = subprocess.Popen([sys.executable, os.path.join(BASE, "app.py"),
-        "--port", "5358", "--web", "8080", "--uphost", "127.0.0.1", "--upport", "5354",
+        "--port", "5358", "--web", "8199", "--uphost", "127.0.0.1", "--upport", "5354",
         "--db", LIM_DB, "--no-doh", "--no-bypass"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     try:
@@ -109,7 +109,7 @@ def integration_tests():
         check("GET /api/limits/<id> -> 200 with domains", code == 200 and j["domains"] == ["prom.ua"])
 
         # detail page served (HTML; fetched via curl since http() expects JSON)
-        raw = subprocess.run(["curl", "-s", "http://127.0.0.1:8080/limit/%d" % lid],
+        raw = subprocess.run(["curl", "-s", "http://127.0.0.1:8199/limit/%d" % lid],
                              capture_output=True, text=True).stdout
         check("GET /limit/<id> serves limit.html", "Add domains" in raw)
 

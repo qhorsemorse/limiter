@@ -93,7 +93,12 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/workout":
             return self._send(200, WORKOUT.status())
         if path == "/api/work":
-            return self._send(200, WORK.status())
+            # status() advances the phase machine in real time (a stretch may
+            # have ended while the client was quiet) -> re-sync the device's
+            # block window so the resolver follows the work/rest rhythm.
+            st = WORK.status()
+            STORE.set_work_until(st.get("work_until_ms", 0))
+            return self._send(200, st)
         return self._send(404, {"error": "not found"})
 
     def do_POST(self):
@@ -131,10 +136,10 @@ class Handler(BaseHTTPRequestHandler):
                 st = w.add_card(rec.get("name"), rec.get("kind"))
             elif action == "remove_card":
                 st = w.remove_card(rec.get("cid"))
-            elif action == "set_budget":
-                st = w.set_budget(rec.get("ms"))
-            elif action == "set_limit":
-                st = w.set_limit(rec.get("ms"))
+            elif action == "set_goal":
+                st = w.set_goal(rec.get("ms"))
+            elif action == "set_interval":
+                st = w.set_interval(rec.get("work_ms"), rec.get("rest_ms"))
             elif action == "set_penalty":
                 st = w.set_penalty(rec.get("ms"))
             elif action == "set_active_card":

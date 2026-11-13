@@ -1,32 +1,36 @@
-"""Work / focus-session feature tests (unit + live integration).
+"""Work / focus-session feature tests (unit + live integration) — pomodoro goal.
 
-Covers:
-  * the Work state machine (work.py): monotonic limit/budget, success on
-    reaching the minimum, failure+penalty when the timer runs out, and
-    cheat-resistance (client-posted deltas capped by real elapsed time).
-  * integration against a live single-host app.py: the block-eom-thing
-    behaviour — a normally-FREE domain is blocked while a work session is
-    active (and un-blocked after), plus the penalty window.
+Covers the v6 concept:
+  * the Work state machine (work.py): settable DAILY GOAL + work/rest pomodoro
+    stretches; only work-stretch time credits the goal; the resolver's block
+    window is ON during work stretches and OFF during rests; success on
+    reaching the goal; failure + penalty when a day ends with the goal unmet;
+    cheat-resistance (client-posted deltas capped by real elapsed time); and
+    the persisted per-day work-data log.
+  * integration against a live single-host app.py: a normally-FREE domain is
+    blocked during a work stretch, un-blocked during the rest stretch, blocked
+    again for the next work stretch, and stays un-blocked after success. The
+    day-end failure arms a penalty that blocks everything until it expires.
 
 Run with the gateway stopped so :5354 / :8080 are free (see README §8).
 """
-import sys, os, time, socket, struct, subprocess, shutil, json, urllib.request
+import sys, os, time, socket, struct, subprocess, json, urllib.request
 
 BASE = "/home/pietro/limiter"
 sys.path.insert(0, BASE)
-# small floors/timers so the cheat-resistant (real-elapsed-capped) tick loop is
-# fast in the unit tests without waiting real minutes.
-os.environ["MIN_WORK_BUDGET_MS"] = "1000"
-os.environ["MIN_WORK_MIN_MS"] = "500"
-os.environ["WORK_BUDGET_MS"] = "6000"
-os.environ["WORK_MIN_MS"] = "2000"
-os.environ["WORK_PALTY_MS"] = "2000"
+# small goals/stretches so the cheat-resistant (real-elapsed-capped) tick loop
+# is fast in the unit tests without waiting real minutes.
+os.environ["MIN_WORK_GOAL_MS"] = "500"
+os.environ["WORK_GOAL_MS"] = "3000"        # default goal 3 s
+os.environ["WORK_INTERVAL_MS"] = "2000"    # default work stretch 2 s
+os.environ["WORK_REST_MS"] = "1000"        # default rest stretch 1 s
+os.environ["MIN_WORK_INTERVAL_MS"] = "100"
+os.environ["WORK_PALTY_MS"] = "2000"       # 2 s penalty
 import work as WK
 import dns as DNS
 
 WORK_DB = "/tmp/test_work_limits.db"
 WORK_FILE = "/tmp/test_work.json"
-WORK_PALTY_FILE = "/tmp/test_work_palty.json"
 
 def rm(p):
     for f in (p, p+"-wal", p+"-shm"):
@@ -35,6 +39,8 @@ def rm(p):
 def rm_workfile():
     for f in (WORK_FILE, WORK_FILE+".tmp"):
         if os.path.exists(f): os.remove(f)
+
+NOW = lambda: time.time()*1000
 
 # ---------------------------------------------------------------------------
 # unit tests (state machine only)
@@ -48,73 +54,131 @@ def unit_tests():
     rm_workfile()
     w = WK.Work(WORK_FILE)
 
-    # first card establishes the common minimum (floor), and it is monotonic
+    # setpoints: goal freely adjustable (clamped), intervals settable
     s = w.add_card("Email", "communication")
-    check("add_card creates a card + establishes limit",
-          len(s["cards"]) == 1 and s["cards"][0]["kind"] == "communication"
-          and s["limit_ms"] >= WK.MIN_MIN_MS)
+    check("add_card creates a card", len(s["cards"]) == 1 and s["cards"][0]["kind"] == "communication")
+    check("status exposes goal + intervals",
+          s["goal_ms"] >= WK.MIN_GOAL_MS and s["work_interval_ms"] > 0 and s["rest_interval_ms"] > 0)
+    s = w.set_goal(4000); check("set_goal raises the goal", s["goal_ms"] == 4000)
+    s = w.set_goal(1000); check("set_goal can LOWER the goal (settable, not monotonic)", s["goal_ms"] == 1000)
+    s = w.set_goal(1); check("goal clamps to floor", s["goal_ms"] == WK.MIN_GOAL_MS)
+    s = w.set_goal(10**12); check("goal clamps to 8h cap", s["goal_ms"] == WK.MAX_MS)
+    s = w.set_goal(4000)
+    s = w.set_interval(work_ms=3000, rest_ms=1500)
+    check("set_interval work+rest", s["work_interval_ms"] == 3000 and s["rest_interval_ms"] == 1500)
+    s = w.set_interval(rest_ms=0); check("rest stretch may be 0", s["rest_interval_ms"] == 0)
+    s = w.set_interval(work_ms=1, rest_ms=1500)
+    check("work stretch clamps to floor", s["work_interval_ms"] == WK.MIN_WORK_MS)
+    s = w.set_interval(work_ms=3000, rest_ms=1500)   # the stretch lengths for the run below
 
-    # limit can only grow, never shrink
-    s = w.set_limit(s["limit_ms"] - 1)            # try to LOWER -> ignored
-    check("set_limit monotonic (lower ignored)", s["limit_ms"] >= WK.MIN_MIN_MS)
-    newlim = s["limit_ms"] + 5000
-    s = w.set_limit(newlim)
-    check("set_limit can raise", s["limit_ms"] == newlim)
-
-    # budget monotonic too
-    s = w.set_budget(s["budget_ms"] - 1)
-    check("set_budget monotonic (lower ignored)", s["budget_ms"] >= WK.MIN_BUDGET_MS)
-    s = w.set_budget(WK.MIN_BUDGET_MS)            # floor it
-
-    # ---- success path ---- (budget default 6s > limit default 2s -> min first)
+    # ---- start: working, work stretch armed, block ON ----
     s = w.start()
-    check("start -> session working", s["session"] == "working" and s["work_until_ms"] > time.time()*1000)
+    check("start -> working (work stretch)",
+          s["session"] == "working" and s["phase"] == "work"
+          and s["work_until_ms"] > NOW() and s["phase_left_ms"] > 2500)
     # cheat-resistance: a huge claimed delta is capped by REAL elapsed time
     time.sleep(0.05)
     s, err = w.tick(10_000_000)
-    check("tick cheat-resistant (accrued << claimed delta)", err is None and s["accrued_ms"] < 5000)
-    # keep crediting until the minimum is reached (real time)
+    check("tick cheat-resistant (accrued << claimed delta)", err is None and s["accrued_ms"] < 500)
+
+    # work stretch (3 s) ends -> RESTING: block OFF, rest starts accumulating
     _t = 0
-    while s["session"] != "success" and _t < 30:
-        time.sleep(0.1); _t += 0.1
-        s, err = w.tick(10_000_000)               # huge delta, capped by real elapsed
-    check("success after reaching the minimum", s["session"] == "success" and s["accrued_ms"] >= s["limit_ms"])
+    while s["session"] != "resting" and _t < 20:
+        time.sleep(0.2); _t += 0.2
+        s, err = w.tick(10_000_000)
+    check("work stretch ends -> rest stretch", s["session"] == "resting" and s["phase"] == "rest")
+    check("rest stretch clears the block window", s["work_until_ms"] == 0)
+    a_work = s["accrued_ms"]
+    check("work time credited ~= one work stretch", 2800 <= a_work <= 3600)
+    time.sleep(0.5); s, err = w.tick(10_000_000)
+    check("rest minutes accumulate (but don't credit the goal) while the goal is frozen",
+          s["rested_ms"] >= 400 and s["accrued_ms"] == a_work)
+
+    # rest stretch (1.5 s) ends -> working again, block re-armed
+    _t = 0
+    while s["session"] != "working" and _t < 20:
+        time.sleep(0.2); _t += 0.2
+        s, err = w.tick(10_000_000)
+    check("rest stretch ends -> next work stretch", s["session"] == "working" and s["cycles"] >= 1)
+    check("block re-armed for the new work stretch", s["work_until_ms"] > NOW())
+
+    # goal (4 s) reached during the 2nd work stretch -> SUCCESS, log written
+    _t = 0
+    while s["session"] != "success" and _t < 20:
+        time.sleep(0.2); _t += 0.2
+        s, err = w.tick(10_000_000)
+    check("success after reaching the goal", s["session"] == "success" and s["complete"])
+    check("success caps accrued at the goal", s["accrued_ms"] == 4000)
     check("success clears the block window", s["work_until_ms"] == 0)
+    check("focused card carries the credited time",
+          any(c["accrued_ms"] >= 3000 for c in s["cards"]))
+    today = s["date"]
+    check("work-data log stores the day", any(
+        e["date"] == today and e["done"] and not e["failed"]
+        and e["worked_ms"] == 4000 and e["rested_ms"] > 0 and e["cycles"] >= 1
+        for e in s["log"]))
+    check("JSON file persists the log", "log" in json.load(open(WORK_FILE)))
 
-    # ---- failure path + penalty (budget 6s < limit 7s -> timer runs out first) ----
-    rm_workfile()
-    w = WK.Work(WORK_FILE)
-    w.add_card("Task", "task")
-    w.set_limit(7000)                               # 7s minimum (> budget)
-    w.set_budget(6000)                              # 6s budget < minimum
+    # no restart of a done day
     s = w.start()
-    _t = 0
-    while s["session"] != "failed" and _t < 30:
-        time.sleep(0.1); _t += 0.1
-        s, err = w.tick(10_000_000)               # huge delta, capped by real elapsed
-    check("failure when timer runs out first", s["session"] == "failed")
-    check("failure arms a penalty window", s["penalty_active"] and s["penalty_left_ms"] > 0)
-    check("failed status keeps the block window armed", s["work_until_ms"] > time.time()*1000)
+    check("start rejected after success", s["session"] == "success")
 
-    # pause/resume don't accrue while paused
+    # ---- pause semantics ----
     rm_workfile()
     w = WK.Work(WORK_FILE)
-    w.add_card("T","task"); w.set_limit(60*60*1000); w.set_budget(60*60*1000)
-    w.start()
-    time.sleep(0.2); s = w.pause()
-    a1 = s["accrued_ms"]
-    time.sleep(0.3); s = w.status()
-    check("pause does not accrue", s["accrued_ms"] == a1 and s["session"] == "paused")
-    s = w.resume(); time.sleep(0.2); s, _err = w.tick(10_000_000)
+    w.set_interval(work_ms=5000, rest_ms=5000)
+    w.set_goal(3600_000)
+    w.start(); time.sleep(0.3)
+    s = w.pause()
+    a1 = s["accrued_ms"]; pl1 = s["phase_left_ms"]
+    check("pause mid work stretch KEEPS the block", s["session"] == "paused" and s["work_until_ms"] > NOW())
+    time.sleep(0.4); s = w.status()
+    check("pause freezes credit", s["accrued_ms"] == a1)
+    s = w.resume()
+    check("resume back to work stretch", s["session"] == "working" and s["phase_left_ms"] <= pl1)
+    time.sleep(0.3); s, _e = w.tick(10_000_000)
     check("resume accrues again", s["accrued_ms"] > a1)
+    # into the rest stretch, then pause there -> block stays OFF
+    _t = 0
+    while s["session"] != "resting" and _t < 20:
+        time.sleep(0.3); _t += 0.3
+        s, _e = w.tick(10_000_000)
+    s = w.pause()
+    check("pause mid rest stretch keeps the block OFF", s["session"] == "paused" and s["work_until_ms"] == 0)
+    s = w.resume(); time.sleep(0.2); s, _e = w.tick(10_000_000)
+    check("resume from rest", s["session"] in ("resting", "working"))
 
-    rm(WORK_FILE); rm_workfile()
+    # ---- day-end failure + penalty (simulate 00:00 by moving the date back) ----
+    rm_workfile()
+    w = WK.Work(WORK_FILE)
+    w.add_card("T", "task"); w.set_goal(4000); w.set_interval(work_ms=3000, rest_ms=0)
+    s = w.start(); time.sleep(0.3); s, _e = w.tick(10_000_000)
+    w.state["date"] = "1999-01-01"          # pretend midnight passed mid-session
+    w._save()
+    s = w.status()
+    check("day ends short of the goal -> FAILURE", s["session"] == "failed" and s["failed"])
+    check("failure arms the penalty block", s["penalty_active"] and s["work_until_ms"] > NOW())
+    check("failed day logged in the work-data log", any(
+        e["date"] == "1999-01-01" and e["failed"] and not e["done"] and 0 < e["worked_ms"] < 4000
+        for e in s["log"]))
+    s = w.start()
+    check("start rejected while failed", s["session"] == "failed")
+    time.sleep(2.3)
+    s = w.status()
+    check("penalty expires", not s["penalty_active"] and s["work_until_ms"] == 0)
+    check("day stays closed after the penalty (renews at 00:00)", s["session"] == "failed")
+
+    rm_workfile()
     return ok
 
 # ---------------------------------------------------------------------------
 # integration tests (live app.py over the real DNS resolver)
 # ---------------------------------------------------------------------------
-def http(method, path, body=None, base="http://127.0.0.1:8080"):
+# the test app gets its own web port so a live gateway on :8080 can keep running
+APP_WEB = 8199
+
+def http(method, path, body=None, base=None):
+    base = base or ("http://127.0.0.1:%d" % APP_WEB)
     url = base + path
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method,
@@ -156,6 +220,7 @@ def dns_query(name, port=5358):  # 5358 = app plain-DNS sinkhole (query target)
     return None
 
 def stub():
+    import threading
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("127.0.0.1", 5354))
     def loop():
         while True:
@@ -175,7 +240,23 @@ def stub():
     threading.Thread(target=loop, daemon=True).start()
     return s
 
-import threading
+def start_app(env):
+    proc = subprocess.Popen([sys.executable, os.path.join(BASE, "app.py"),
+        "--port", "5358", "--web", str(APP_WEB), "--uphost", "127.0.0.1", "--upport", "5354",
+        "--db", WORK_DB, "--no-doh", "--no-bypass"],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    for _ in range(50):
+        try:
+            if http("GET", "/api/health")[1].get("ok"): break
+        except Exception: pass
+        time.sleep(0.2)
+    return proc
+
+def stop_app(proc):
+    proc.terminate()
+    try: proc.wait(timeout=3)
+    except Exception: proc.kill()
+
 def integration_tests():
     ok = True
     def check(name, cond):
@@ -184,108 +265,109 @@ def integration_tests():
 
     rm(WORK_DB); rm_workfile()
     env = os.environ.copy()
-    env["MIN_WORK_BUDGET_MS"] = "1000"
-    env["MIN_WORK_MIN_MS"] = "500"
-    env["WORK_BUDGET_MS"] = "6000"     # 6s budget
-    env["WORK_MIN_MS"] = "2000"        # 2s minimum
-    env["WORK_PALTY_MS"] = "2000"      # 2s penalty
+    env["WORK_GOAL_MS"] = "2000"        # 2 s of real work to reach
+    env["WORK_INTERVAL_MS"] = "1500"    # 1.5 s work stretches
+    env["WORK_REST_MS"] = "1000"        # 1 s rest stretches
+    env["MIN_WORK_GOAL_MS"] = "500"
+    env["MIN_WORK_INTERVAL_MS"] = "100"
+    env["WORK_PALTY_MS"] = "2000"       # 2 s penalty
     env["WORK_FILE"] = WORK_FILE
 
     # stub = upstream (5354): answers 9.9.9.9 for any A query.
     # app sinkhole is the query target (5358); it enforces limits + work block and
     # forwards allowed queries to the stub upstream.
     stub(); time.sleep(0.2)
-    proc = subprocess.Popen([sys.executable, os.path.join(BASE, "app.py"),
-        "--port", "5358", "--web", "8080", "--uphost", "127.0.0.1", "--upport", "5354",
-        "--db", WORK_DB, "--no-doh", "--no-bypass"],
-        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    proc = start_app(env)
     try:
-        for _ in range(50):
-            try:
-                if http("GET", "/api/health")[1].get("ok"): break
-            except Exception: pass
-            time.sleep(0.2)
-
-        # pages + endpoints exist
+        # pages + endpoints exist with the new fields
         code = subprocess.run(["curl","-s","-o","/dev/null","-w","%{http_code}",
-            "http://127.0.0.1:8080/work.html"], capture_output=True, text=True).stdout
+            "http://127.0.0.1:%d/work.html" % APP_WEB], capture_output=True, text=True).stdout
         check("/work.html served (200)", code == "200")
-        body = subprocess.run(["curl","-s","http://127.0.0.1:8080/work.html"], capture_output=True, text=True).stdout
-        check("/work.html is the Work page", "Work" in body and "Start Work" in body)
-        check("GET /api/work has fields", "budget_ms" in http("GET","/api/work")[1])
+        body = subprocess.run(["curl","-s","http://127.0.0.1:%d/work.html" % APP_WEB], capture_output=True, text=True).stdout
+        check("/work.html is the pomodoro goal page",
+              "Daily goal" in body and "Start Work" in body and "set_goal" in body)
+        s = http("GET", "/api/work")[1]
+        check("GET /api/work has the new fields",
+              all(k in s for k in ("goal_ms", "work_interval_ms", "rest_interval_ms",
+                                   "accrued_ms", "rested_ms", "cycles", "phase", "log")))
 
         # add an absolute limit + a free time-limit
         http("POST", "/api/limits", {"name": "prom", "type": "absolute", "domains": ["prom.ua"]})
         http("POST", "/api/limits", {"name": "free", "type": "time", "domains": ["free.ua"],
             "grace_min": 40, "cooldown_min": 120})
 
-        # baseline: free.ua (free state) forwards
+        # baseline
         check("free.ua forwards BEFORE work (9.9.9.9)", dns_query("free.ua") == "9.9.9.9")
         check("prom.ua blocked BEFORE work (0.0.0.0)", dns_query("prom.ua") == "0.0.0.0")
 
-        # create a card + start a work session -> should block everything
+        # start -> WORK stretch: block ON
         http("POST", "/api/work", {"action": "add_card", "name": "Task", "kind": "task"})
+        s = http("POST", "/api/work", {"action": "set_goal", "ms": 2000})[1]
+        check("set_goal over HTTP", s["goal_ms"] == 2000)
+        s = http("POST", "/api/work", {"action": "set_interval", "work_ms": 1500, "rest_ms": 1000})[1]
+        check("set_interval over HTTP", s["work_interval_ms"] == 1500 and s["rest_interval_ms"] == 1000)
         s = http("POST", "/api/work", {"action": "start"})[1]
-        check("start arms the block window", s["session"] == "working" and s["work_until_ms"] > time.time()*1000)
-        check("free.ua BLOCKED during work session (0.0.0.0)", dns_query("free.ua") == "0.0.0.0")
+        check("start arms the block window", s["session"] == "working" and s["work_until_ms"] > NOW())
+        check("free.ua BLOCKED during the work stretch (0.0.0.0)", dns_query("free.ua") == "0.0.0.0")
 
-        # tick to reach the minimum -> success -> unblock
-        _t = 0
-        while s["session"] != "success" and _t < 40:
-            time.sleep(0.1); _t += 0.1
+        # the 1.5 s work stretch ends -> REST: block OFF (the pomodoro break)
+        _t = 0; s = {}
+        while s.get("session") != "resting" and _t < 30:
+            time.sleep(0.25); _t += 0.25
             s = http("POST", "/api/work", {"action": "tick", "delta_ms": 10_000_000})[1]
-        check("session reaches success over HTTP", s["session"] == "success")
-        check("free.ua FORWARDS again after success (un-blocked)", dns_query("free.ua") == "9.9.9.9")
+        check("work stretch ends -> rest stretch over HTTP", s.get("session") == "resting")
+        time.sleep(0.3)
+        check("free.ua UN-BLOCKED during the rest stretch (9.9.9.9)", dns_query("free.ua") == "9.9.9.9")
 
-        # failure + penalty path: tiny budget, large minimum
-        rm_workfile()
-        # restart so the fresh tiny-budget/large-min config applies
-        proc.terminate()
-        try: proc.wait(timeout=3)
-        except Exception: proc.kill()
-        env2 = env.copy()
-        # failure path: budget floor (1s) BELOW the minimum floor (60s), so a fresh
-        # session can never accrue the 60s minimum before its 1s budget runs out.
-        env2["MIN_WORK_BUDGET_MS"] = "1000"   # budget floor 1s
-        env2["MIN_WORK_MIN_MS"] = "60000"     # minimum floor 60s (> budget)
-        env2["WORK_BUDGET_MS"] = "1000"       # 1s budget
-        env2["WORK_MIN_MS"] = "60000"         # 60s minimum (never reached)
-        env2["WORK_PALTY_MS"] = "2000"        # 2s penalty
-        proc = subprocess.Popen([sys.executable, os.path.join(BASE, "app.py"),
-            "--port", "5358", "--web", "8080", "--uphost", "127.0.0.1", "--upport", "5354",
-            "--db", WORK_DB, "--no-doh", "--no-bypass"],
-            env=env2, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        for _ in range(50):
-            try:
-                if http("GET", "/api/health")[1].get("ok"): break
-            except Exception: pass
-            time.sleep(0.2)
-
-        http("POST", "/api/work", {"action": "add_card", "name": "Task", "kind": "task"})
-        http("POST", "/api/work", {"action": "start"})
+        # the 1 s rest ends -> next WORK stretch: block ON again
         _t = 0
-        while True:
-            time.sleep(0.1); _t += 0.1
+        while s.get("session") != "working" and _t < 30:
+            time.sleep(0.25); _t += 0.25
             s = http("POST", "/api/work", {"action": "tick", "delta_ms": 10_000_000})[1]
-            if s["session"] == "failed": break
-            if _t > 40: break
-        check("session FAILS when timer runs out first", s["session"] == "failed")
-        check("penalty active after failure (everything still blocked)",
-              s.get("penalty_active") and dns_query("free.ua") == "0.0.0.0")
-
-        # wait for penalty to expire, then it should unblock
-        _t = 0
-        while _t < 40:
-            s = http("GET", "/api/work")[1]
-            if not s["penalty_active"]: break
-            time.sleep(0.1); _t += 0.1
-        check("penalty clears after its window", not s["penalty_active"])
         time.sleep(0.2)
-        check("free.ua FORWARDS again after penalty expires", dns_query("free.ua") == "9.9.9.9")
+        check("next work stretch re-blocks free.ua (0.0.0.0)", dns_query("free.ua") == "0.0.0.0")
+
+        # goal (2 s of work) is met inside the 2nd stretch -> success, stays free
+        _t = 0
+        while s.get("session") != "success" and _t < 30:
+            time.sleep(0.25); _t += 0.25
+            s = http("POST", "/api/work", {"action": "tick", "delta_ms": 10_000_000})[1]
+        check("session reaches success over HTTP", s.get("session") == "success" and s.get("complete"))
+        time.sleep(0.3)
+        check("free.ua FORWARDS after success (un-blocked)", dns_query("free.ua") == "9.9.9.9")
+        today = s.get("date")
+        check("day stored in the work-data log (done)", any(
+            e["date"] == today and e["done"] and not e["failed"] and e["worked_ms"] >= 1500
+            for e in s.get("log", [])))
     finally:
-        proc.terminate()
-        try: proc.wait(timeout=3)
-        except Exception: proc.kill()
+        stop_app(proc)
+
+    # ---- day-end failure -> penalty window (re-start the app over a crafted
+    # state whose date is in the past: the first status() finalizes the day) ----
+    with open(WORK_FILE, "w") as f:
+        json.dump({"date": "1999-01-01", "session": "working", "phase": "work",
+                   "phase_end_ms": NOW() + 30000, "accrued_ms": 500.0, "rested_ms": 0.0,
+                   "cycles": 0, "goal_ms": 2000, "work_ms": 1500, "rest_ms": 1000,
+                   "penalty_ms": 2000, "cards": [], "active_card_id": None, "log": []}, f)
+    proc = start_app(env)
+    try:
+        s = http("GET", "/api/work")[1]
+        check("day ending short of the goal -> failed + penalty via HTTP",
+              s.get("session") == "failed" and s.get("penalty_active"))
+        check("worked day kept in the log as failed", any(
+            e["date"] == "1999-01-01" and e["failed"] and not e["done"] for e in s.get("log", [])))
+        time.sleep(0.3)
+        check("penalty window BLOCKS free.ua (0.0.0.0)", dns_query("free.ua") == "0.0.0.0")
+        _t = 0
+        while _t < 30:
+            s = http("GET", "/api/work")[1]
+            if not s.get("penalty_active"): break
+            time.sleep(0.25); _t += 0.25
+        check("penalty clears after its window", not s.get("penalty_active"))
+        time.sleep(0.3)
+        check("free.ua FORWARDS again after the penalty expires", dns_query("free.ua") == "9.9.9.9")
+    finally:
+        stop_app(proc)
         rm(WORK_DB); rm_workfile()
     return ok
 

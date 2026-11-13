@@ -1,6 +1,49 @@
-# HANDOFF PROMPT — "Control Limits" (v5 — central + secondary architecture, ~2026-10-16)
+# HANDOFF PROMPT — "Control Limits" (v6 — central + secondary architecture + Work pomodoro goal, ~2026-11-13)
 
 === BEGIN HANDOFF PROMPT ===
+
+## 0c. WHAT CHANGED THIS SESSION (v5 → v6): WORK TIMER IS NOW A POMODORO GOAL TIMER
+
+The **Work** feature (`work.py` / `work.html` / `test_work.py`, wired in `app.py` +
+`secondary.py`) was RECONCEPTUALIZED at the user's request. The old design (a
+button-timer with a *max budget* against a *monotonic common minimum*) is GONE.
+New concept — read the `work.py` module doc for the full rules:
+
+* **Daily goal**: the user sets a target of real work-minutes per day
+  (`POST /api/work {action:"set_goal", ms}` or the UI). Settable in BOTH directions
+  (clamped to `[MIN_WORK_GOAL_MS, 8h]`), stored in `data/work.json`, survives the
+  00:00 reset. The old `limit_ms`/`budget_ms` no longer exist (`set_limit` /
+  `set_budget` / `budget_ms` are removed; old files migrate: `limit_ms` → `goal_ms`).
+* **Pomodoro stretches**: work stretch (default 50 min) / rest stretch (default
+  10 min), settable via `{action:"set_interval", work_ms?, rest_ms?}` (rest may be
+  0). The timer cycles WORK → REST → WORK until the goal is met.
+* **Blocking follows the phase**: WORK stretch → the resolver blocks EVERYTHING
+  (via the same `store.set_work_until`/`work_active` window as before); REST
+  stretch → the block is OFF (a real break). `work_until_ms` is now the exact
+  wall-clock end of the current work stretch (no more worst-case whole-session
+  window). Paused-during-work keeps blocking until resume/00:00;
+  paused-during-rest stays unblocked.
+* **Only work minutes count**: real work-stretch time is credited to the goal
+  (`accrued_ms`); rest time is only *recorded* (`rested_ms`). A day reaching the
+  goal → `success` (done for the day). A day that ENDS at 00:00 with the session
+  still active and the goal unmet → `failed`: the penalty window arms
+  (`WORK_PALTY_MS`, default 30 min), the day is logged as failed, no new session
+  until 00:00. (There is no more mid-session "budget ran out" failure.)
+* **Work data is stored (no display UI yet, per the user)**: a per-day record in
+  `data/work.json` → `"log"`: `{date, goal_ms, worked_ms, rested_ms, cycles, done,
+  failed}`. It is included in `GET /api/work` so a future progress UI can display
+  it. The user explicitly said the progress-display UI is NOT now.
+* **Cheat-resistance kept + strengthened**: credit (work AND rest) is capped by
+  real elapsed wall-clock between ticks; phase boundaries are anchored to SERVER
+  time (a phase ends exactly when it should even if the client lags/restarts),
+  and `status()` auto-advances expired phases. Because of that auto-advance,
+  `app.py` and `secondary.py` now re-sync the store's block window on
+  `GET /api/work` as well (after every POST it already did).
+* All 9 suites are green (`test_work.py` rewritten: unit + live end-to-end proving
+  blocked-during-work / unblocked-during-rest / re-block / success / day-end
+  penalty through the real resolver). `test_app.py` / `test_limit.py` now boot
+  their test app on web :8199 with `--no-doh --no-bypass` so they can run while a
+  live gateway holds :8080/:8443 (same reason `test_work.py` uses :8199).
 
 You are taking over a project called **Control Limits** at `/home/pietro/limiter/`.
 This is a REAL, running project. Read this document, then read the code, then do
@@ -86,7 +129,7 @@ Firefox (DoH, locked to 127.0.0.1:<dohport> on THIS device)
                  ├─ bypass watcher    (device-local nuclear detection)
                  ├─ sync ticker       (keeps the local cache fresh, TTL-driven)
                  ├─ workout (per-device, local)
-                 ├─ work          (per-device, local) — focus-session block-e window + timer, honours store.work_active(now)
+                 ├─ work          (per-device, local) — pomodoro goal timer; block-e window follows work stretches, honours store.work_active(now)
                  └─ child web UI/API  :8080   (status + READ-ONLY limits view + work nav)
                      │
                      ▼  RemoteStore — answers from a LOCAL COPY of the central DB
@@ -133,7 +176,7 @@ of the workout with the opposite effect):
 | File | Change |
 |---|---|
 | `dns.py` | `resolve_bytes` gains a block-e window: while `store.work_active(now)` is true, every domain (time-limit AND absolute) resolves to `0.0.0.0` (localhost exempt) — the inverse of the workout reward pass. Placed right after the reward check and before nuclear. |
-| `store.py` / `remote_store.py` | Added `work_until`, `set_work_until(ms)`, `work_active(now)` — a per-session block-e window, synced from the Work state machine after each mutating `/api/work` action and restored on boot. |
+| `store.py` / `remote_store.py` | Added `work_until`, `set_work_until(ms)`, `work_active(now)` — the block-e window, synced from the Work state machine after each `GET` and mutating `POST /api/work` (v6: `GET` too, because `status()` auto-advances phases) and restored on boot. |
 | `app.py` | Serves `/work.html`; `GET/POST /api/work` (add/remove/set_card/start/pause/resume/tick); restores the work block-e window on boot via `set_work_until`. |
 | `secondary.py` | Serves `/work.html`; `GET/POST /api/work`; per-device Work state machine; syncs `set_work_until` onto the `RemoteStore` so the block-e is enforced on the device. |
 | `index.html` / `workout.html` / `secondary_index.html` | Nav bar gains a **Work** link. |
@@ -142,8 +185,8 @@ of the workout with the opposite effect):
 
 | File | Role | Status |
 |---|---|---|
-| `work.py` | Daily focus-session state machine: button start/pause/resume timer (cheat-capped like workout), multiple cards sharing one common monotonic minimum, per-day reset, penalty window on failure, and the `work_active` window the resolver honours. Persists to `data/work.json`. | done, tested |
-| `work.html` | Page 3 — cards, the common minimum, the timer, and the start/pause/resume button + penalty display. | done |
+| `work.py` | Daily **pomodoro goal** state machine (v6): settable daily goal + work/rest stretch lengths, wall-clock-credited work-time (rest only recorded), block only during work stretches, day-end failure + penalty, per-day work-data log. Persists to `data/work.json`. | done, tested |
+| `work.html` | Page 3 — goal + stretch settings, the work/rest dial, start/pause/resume, task cards, penalty, "worked / goal" line (no fancy progress UI yet by design). | done |
 | `test_work.py` | Work feature tests: unit for the state machine + live end-to-end through the real DNS resolver (session blocks every domain, penalty window, un-block on completion). | green |
 
 **this handoff's prior NEW table (central/secondary, v5) is still valid and unchanged.**
@@ -229,8 +272,9 @@ on `127.0.0.1:5354` means the gateway is still running. `test_bypass.py` still d
 - Snap Firefox profile lives under `~/snap/firefox/common/…`. Snap has a private /tmp.
 - `_proc/net/*` hex addresses are **host-byte-order u32** on little-endian — reverse the bytes.
 - `doh.py` uses `ThreadingHTTPServer` + `ctx.wrap_socket(server_sock)`.
-- **Work block-e window (`store.work_active(now)`)** sits in `dns.resolve_bytes` RIGHT AFTER the reward check and BEFORE nuclear — it is the inverse of the workout reward: while a work session (or penalty) is active, EVERY domain (time-limit AND absolute) resolves to `0.0.0.0` (localhost exempt). Set/clear it via `set_work_until(ms)` and re-arm it on boot. It is a per-device LOCAL concern on the secondary (synced onto the `RemoteStore`), like the workout — the central does not own it.
-- **Work minimum is monotonic** (set at the first card's creation, can only grow) and **work timer is capped by real elapsed wall-clock** between ticks (cheat-resistance, same as the workout) — never trust a big client-reported delta.
+- **Work block-e window (`store.work_active(now)`)** sits in `dns.resolve_bytes` RIGHT AFTER the reward check and BEFORE nuclear — it is the inverse of the workout reward: while active, EVERY domain (time-limit AND absolute) resolves to `0.0.0.0` (localhost exempt). v6: the window equals the exact wall-clock END OF THE CURRENT WORK STRETCH (0 during rests, until-resume/00:00 when paused in work, the penalty expiry when failed). Set/clear it via `set_work_until(ms)` — synced after every `GET` AND `POST /api/work`, and re-armed on boot. It is a per-device LOCAL concern on the secondary (synced onto the `RemoteStore`), like the workout — the central does not own it.
+- **Work (v6) cheat-resistance & rhythm**: credited work/rest time is capped by real elapsed wall-clock between ticks (never trust a big client-reported delta), and the work/rest phase boundaries are anchored to the SERVER wall clock (a phase ends exactly when it should, even across client lag / gateway restart; `status()` auto-advances expired phases and `Work._advance` is the ONLY place phases flip). The daily GOAL is freely settable (NOT monotonic — that was the old minimum) but clamped to `[MIN_WORK_GOAL_MS, 8h]`.
+- **Work (v6) failure is a DAY-END event**: a session failing mid-day (old "budget ran out") no longer exists; the penalty arms only in `_maybe_reset` when 00:00 catches the session active with `accrued < goal`. The per-day record in `data/work.json["log"]` is THE stored work data the user asked for (display UI explicitly deferred).
 - `index.html`/`secondary_index.html` are served stale until the browser refreshes.
 - Fail-closed offline is the default; `--allow-free-offline` flips it. Locks block always.
 
@@ -248,7 +292,7 @@ on `127.0.0.1:5354` means the gateway is still running. `test_bypass.py` still d
    `app.py` (GET /api/limits/<id>, POST /api/limits/<id>/domains, /limit/<id> route),
    `db.py`, `store.py`, and `index.html` (limit cards are now clickable → detail page);
    new file `limit.html`. Tested by `test_limit.py`. **All 9 suites green.**
-1. **Work / focus-session feature — DONE (this session).** New `work.py` + `work.html` + `test_work.py`, wired into `app.py` and `secondary.py`, with a store-level block-e window (`work_active`) that the resolver honours. All 8 suites green. Behaviour: a session blocks every domain (time-limit AND absolute) while active, has a button start/pause/resume timer, cards sharing one common monotonic minimum, and arms a penalty window when the timer runs out before the minimum is met. See README §1 + the `work.py` module doc for the exact rules.
+1. **Work / pomodoro-goal feature — RECONCEPTUALIZED (v6, this session).** `work.py` + `work.html` + `test_work.py` rewritten (see §0c at the top for the exact new rules and API). All 9 suites green. The old budget/minimum/"timer ran out" failure model is gone: there is now a settable DAILY GOAL, 50/10-style work/rest pomodoro stretches (block on during work, off during rest), only work minutes credited, a per-day stored work-data log, and a penalty armed only when a day ENDS (00:00) short of the goal. If the user asks for the progress display next, the data is already in `GET /api/work` → `log`.
 2. **Live end-to-end proof on real hardware.** Everything is proven in-process
    (test_secondary drives real DoH wire queries through the secondary). The one thing
    left is a real Firefox on a second device pointed at a secondary (steps in §5). If a

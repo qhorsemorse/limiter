@@ -11,7 +11,7 @@ def rm_db():
         if os.path.exists(f): os.remove(f)
 
 def http(method, path, body=None):
-    url="http://127.0.0.1:8080"+path
+    url="http://127.0.0.1:8199"+path
     data=json.dumps(body).encode() if body is not None else None
     req=urllib.request.Request(url, data=data, method=method,
         headers={"Content-Type":"application/json"} if data else {})
@@ -82,7 +82,8 @@ stub()
 time.sleep(0.2)
 
 proc=subprocess.Popen([sys.executable, os.path.join(BASE,"app.py"),
-    "--port","5353","--web","8080","--uphost","127.0.0.1","--upport","5354","--db",DB],
+    "--port","5353","--web","8199","--uphost","127.0.0.1","--upport","5354","--db",DB,
+    "--no-doh","--no-bypass"],
     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 # wait for boot
 for _ in range(50):
