@@ -31,11 +31,15 @@
   .wtimer.work .wphase{color:#2b6289}
   .wtimer.rest{border-style:solid;border-color:#2a8;background:#e8f5e8;color:#272}
   .wtimer.rest .wphase{color:#2a8}
+  .wtimer.wait{border-style:solid;border-color:#c9a22b;background:#fdf7e0;color:#7a6300;animation:ringpulse 2s ease-in-out infinite}
+  .wtimer.wait .wphase{color:#b8860b}
   .wtimer.done{border-style:solid;border-color:#2a8;background:#e8f5e8;color:#272}
-  .wtimer.penalty{border-style:solid;border-color:#c42;background:#f7ede9;color:#a11}
-  .wtimer.penalty .wphase{color:#c42}
+  @keyframes ringpulse{0%,100%{box-shadow:0 0 0 0 rgba(201,162,43,.0)}50%{box-shadow:0 0 0 8px rgba(201,162,43,.18)}}
   .wstate{margin-top:10px;font-size:14px;min-height:20px}
   #wactions button{margin-top:10px;width:100%;padding:9px 16px;border:none;border-radius:6px;color:#fff;background:#2b6289;cursor:pointer}
+  #wactions button.secondary{background:#8593a5}
+  .tonebtn{margin-top:8px;padding:4px 10px;font-size:12px;border:1px solid #b9c4d6;border-radius:6px;background:#fff;color:#445;cursor:pointer}
+  .tonebtn:hover{background:#eef1f5}
   .wpick{margin:10px 0 4px;flex-wrap:wrap;display:flex;gap:8px;align-items:center;font-size:13px;flex-wrap:wrap}
   .wpick select,.wpick input{padding:4px 8px;border-radius:6px;border:1px solid #b9c4d6;background:#fff}
   .wpick input{width:86px}
@@ -63,9 +67,12 @@
   <p class="sub">Pomodoro goal timer: set a <strong>daily goal</strong> of real work minutes, then the timer runs in
      <strong>work stretches</strong> (everything is blocked — pure focus; these are the minutes that count toward your
      goal) and <strong>rest stretches</strong> (the block is off — take a real break; these don't count).
-     Hit the goal and the day is done; let the day end short of it and you get a penalty.</p>
+     When a work stretch is done a <strong>chime</strong> plays and the break starts automatically. When the break is
+     over, <strong>another chime rings — and keeps ringing — until you start the next work stretch</strong> (or pause it
+     to be quiet): work never starts by itself. Hit the goal and the day is done; a day that ends short of the goal is
+     just logged — the timer is never locked.</p>
   <div class="card work">
-    <h2>Today <span class="tag t-abs">goal · stretches · penalty</span></h2>
+    <h2>Today <span class="tag t-abs">goal · stretches · chimes</span></h2>
     <div class="wsub" id="wsub">Loading…</div>
 
     <div id="wpick" class="wpick">
@@ -89,8 +96,10 @@
     <div id="wacc" class="lim"></div>
     <div id="wstatus" class="wstate">loading…</div>
     <div id="wactions"></div>
+    <button id="wtone" class="tonebtn" title="Play the 'work done' chime (also unmutes sound in this browser)">🔊 test chime</button>
     <div class="wfoot">Work data (worked / rested minutes, stretches, done) is stored per day in this device's
-       work file — a progress display may come later.</div>
+       work file — a progress display may come later. The chimes are played by <em>this page</em> — keep the tab open
+       for the ringing (sound unlocks on the first click, e.g. the test chime button).</div>
   </div>
 
   <div class="addrow">
@@ -108,12 +117,88 @@
 
   <script>
     const $ = s => document.querySelector(s);
-    const WK = { st: null, working: false, timer: null, pending: 0, lastRef: 0 };
+    const WK = { st: null, timer: null, pending: 0, lastRef: 0 };
+
+    // ---------- audio (chimes; WebAudio tones — no sound files needed) ----------
+    // Browsers only allow sound after a first user gesture: every button click
+    // below calls audioCtx() to unlock, and the 🔊 button tests it.
+    const CH = { ctx: null, loop: null };
+    function audioCtx(){
+      if(!CH.ctx){ try{ CH.ctx = new (window.AudioContext||window.webkitAudioContext)(); }catch(e){ CH.ctx = null; } }
+      if(CH.ctx && CH.ctx.state === "suspended"){ CH.ctx.resume().catch(()=>{}); }
+      return CH.ctx;
+    }
+    function tone(ctx, freq, t0, dur, vol){
+      const o = ctx.createOscillator(), g = ctx.createGain();
+      o.type = "sine"; o.frequency.value = freq;
+      g.gain.setValueAtTime(0.0001, t0);
+      g.gain.exponentialRampToValueAtTime(vol, t0 + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+      o.connect(g); g.connect(ctx.destination);
+      o.start(t0); o.stop(t0 + dur + 0.05);
+      const h = ctx.createOscillator(), g2 = ctx.createGain();   // octave harmonic → bell-ish
+      h.type = "sine"; h.frequency.value = freq * 2;
+      g2.gain.setValueAtTime(0.0001, t0);
+      g2.gain.exponentialRampToValueAtTime(vol * 0.25, t0 + 0.02);
+      g2.gain.exponentialRampToValueAtTime(0.0001, t0 + dur * 0.6);
+      h.connect(g2); g2.connect(ctx.destination);
+      h.start(t0); h.stop(t0 + dur);
+    }
+    // "the work is done" — bright two-note rise. Plays when a work stretch ends
+    // (break auto-starts) and when the goal is reached.
+    function chimeBreakStart(){
+      const ctx = audioCtx(); if(!ctx) return;
+      const t = ctx.currentTime + 0.01;
+      tone(ctx, 880.0, t, 0.7, 0.22);            // A5
+      tone(ctx, 1318.5, t + 0.35, 0.9, 0.22);    // E6
+    }
+    // "the break is over — back to work" — three-note call. Plays once when the
+    // break ends, then LOOPS (via CH.loop) until work is resumed or paused.
+    function chimeBreakOver(){
+      const ctx = audioCtx(); if(!ctx) return;
+      const t = ctx.currentTime + 0.01;
+      tone(ctx, 659.25, t, 0.35, 0.2);           // E5
+      tone(ctx, 783.99, t + 0.3, 0.35, 0.2);     // G5
+      tone(ctx, 987.77, t + 0.6, 0.8, 0.2);      // B5
+    }
+    function stopChimeLoop(){ if(CH.loop){ clearInterval(CH.loop); CH.loop = null; } }
+    function ensureChimeLoop(ringNow){
+      const st = WK.st;
+      const want = !!(st && st.session === "waiting");
+      if(want && !CH.loop){
+        if(ringNow) chimeBreakOver();
+        CH.loop = setInterval(()=>{            // keep ringing while waiting
+          const s = WK.st;
+          if(s && s.session === "waiting") chimeBreakOver();
+          else stopChimeLoop();
+        }, 10000);                              // … every 10 s
+      } else if(!want){
+        stopChimeLoop();
+      }
+    }
+    // called on every state update (wLoad / wFlush): fires the transition chimes
+    // and keeps the loop in sync. onStateChange(prev, next, isLoad)
+    function onStateChange(prev, next, isLoad){
+      if(prev && next && prev.date === next.date){
+        if(prev.session === "working" && (next.session === "resting" || next.session === "success"))
+          chimeBreakStart();                    // work done → break starts (or day done)
+        if(prev.session === "resting" && next.session === "waiting")
+          chimeBreakOver();                     // break over → start the loop
+      } else if(!prev && isLoad && next && next.session === "waiting"){
+        chimeBreakOver();                       // page opened mid-wait: ring once
+      }
+      ensureChimeLoop(false);                   // (re)start / stop the 10 s ring loop, no extra ring
+      if(prev && next && prev.session !== next.session) wRender();  // fresh buttons/labels
+    }
 
     async function wLoad(){
-      try { WK.st = await (await fetch("/api/work")).json(); }
-      catch(e){ return; }
-      wRender();
+      try {
+        const prev = WK.st;
+        WK.st = await (await fetch("/api/work")).json();
+        onStateChange(prev, WK.st, true);
+        wRender();
+      }
+      catch(e){}
     }
     function wms(ms){
       ms = Math.max(0, Math.round(ms/1000));
@@ -128,6 +213,7 @@
 
     // ---------- goal / stretch settings ----------
     async function setGoal(){
+      audioCtx();
       const v = parseInt($("#wgoal").value,10);
       if(!$("#wgoal").value || isNaN(v) || v < 1) return;
       $("#wgoal").value = "";
@@ -140,6 +226,7 @@
       wLoad();
     }
     async function setIntervals(){
+      audioCtx();
       const wv = parseInt($("#wwork").value,10);
       const rv = parseInt($("#wrest").value,10);
       const body = {action:"set_interval"};
@@ -190,7 +277,7 @@
       const st = WK.st; if(!st) return;
       const t = $("#wtimer"), phaseEl = $("#wphase"), s = $("#wstatus"), a = $("#wactions");
       a.innerHTML = "";
-      $("#wsub").textContent = "Day " + st.date + " · everything is blocked during work stretches, free during rests.";
+      $("#wsub").textContent = "Day " + st.date + " · everything is blocked during work stretches, free during rests — and while the break-over chime rings.";
 
       // settings (placeholder = current value; type a new one to change it)
       $("#wgoal").placeholder = Math.round(st.goal_ms/60000)+" (current)";
@@ -201,30 +288,16 @@
 
       // timer dials
       const active = (st.session==="working" || st.session==="resting");
+      const waiting = st.session === "waiting";
       t.classList.toggle("work", st.session==="working");
       t.classList.toggle("rest", st.session==="resting");
+      t.classList.toggle("wait", waiting);
       t.classList.toggle("done", st.complete);
-      t.classList.toggle("penalty", st.failed);
       const left = (active || st.session==="paused")
         ? (active ? Math.max(0, st.phase_left_ms - WK.pending) : st.phase_left_ms) : 0;
-      t.childNodes[t.childNodes.length-1].textContent = " " + wms(active||st.session==="paused" ? left : 0);
+      t.childNodes[t.childNodes.length-1].textContent = " "
+        + (waiting ? "--:--" : wms(active || st.session==="paused" ? left : 0));
 
-      if(st.penalty_active){
-        phaseEl.textContent = "PUNISHED";
-        t.childNodes[t.childNodes.length-1].textContent = " " + wms(st.penalty_left_ms);
-        s.innerHTML = "😹 <strong>Day failed</strong> — the previous day ended short of its goal. Everything stays blocked for " +
-          acmd(st.penalty_left_ms) + " so nothing sneaks in. A fresh goal day starts at 00:00.";
-        stopTicking();
-        renderCards();
-        return;
-      }
-      if(st.failed){
-        phaseEl.textContent = "FAILED";
-        s.textContent = "The day ended short of the goal and the penalty is over — no more blocking, but the day is closed. A fresh goal day starts at 00:00.";
-        stopTicking();
-        renderCards();
-        return;
-      }
       if(st.complete){
         phaseEl.textContent = "DONE";
         t.childNodes[t.childNodes.length-1].textContent = " ✓";
@@ -239,24 +312,37 @@
       if(st.session==="idle"){
         phaseEl.textContent = "READY";
         s.textContent = "Pick your goal and stretch lengths above, add a task below, then press Start Work. " +
-          "Work stretches block every site; rest stretches un-block everything.";
+          "Work stretches block every site; rest stretches un-block everything. A chime marks every transition.";
         btn(st, "▶ Start Work");
       } else if(st.session==="working"){
         phaseEl.textContent = "WORK STRETCH · BLOCKED";
         s.textContent = "Focused work — everything is blocked until this stretch ends. " +
-          "These minutes are the ones that count toward your goal.";
+          "These minutes are the ones that count toward your goal. When it ends: chime + automatic break.";
         btn(st, "❍ Pause");
         if(!WK.timer) startTicking();
       } else if(st.session==="resting"){
         phaseEl.textContent = "REST STRETCH · FREE";
-        s.textContent = "Resting — the block is off, break properly. Next work stretch in " + (wms(st.phase_left_ms)) + ".";
+        s.textContent = "Resting — the block is off, break properly. In " + (wms(st.phase_left_ms))
+          + " the break-over chime will ring until you start the next work stretch.";
         btn(st, "❍ Pause");
         if(!WK.timer) startTicking();
+      } else if(st.session==="waiting"){
+        phaseEl.textContent = "BREAK OVER · RINGING";
+        s.textContent = "Break's over — the chime keeps ringing (every 10 s) until you start the next work " +
+          "stretch. Everything is unblocked. Pause to silence it; resume to work.";
+        btn(st, "▶ Start work stretch");
+        btn(st, "❚❚ Pause (silence)", ()=>wAct("pause"), true);
+        stopTicking();
       } else if(st.session==="paused"){
-        phaseEl.textContent = (st.phase==="work" ? "PAUSED · WORK (STILL BLOCKED)" : "PAUSED · REST (FREE)");
-        s.textContent = st.phase==="work"
-          ? "Paused mid work stretch — the block stays on until you resume. Resume when you're ready to work again."
-          : "Paused mid rest — everything stays free until you resume.";
+        if(st.awaiting_work){
+          phaseEl.textContent = "PAUSED · SILENCE";
+          s.textContent = "Paused — the chime is off and everything stays unblocked. Resume to start the next work stretch.";
+        } else {
+          phaseEl.textContent = (st.phase==="work" ? "PAUSED · WORK (STILL BLOCKED)" : "PAUSED · REST (FREE)");
+          s.textContent = st.phase==="work"
+            ? "Paused mid work stretch — the block stays on until you resume. Resume when you're ready to work again."
+            : "Paused mid rest — everything stays free until you resume.";
+        }
         btn(st, "▶ Resume");
         stopTicking();
       }
@@ -271,10 +357,11 @@
       $("#wacc").textContent = "Worked " + acmd(st.accrued_ms) + " / goal " + acmd(st.goal_ms) +
         "  ·  stretch #" + (st.cycles + 1) + "  ·  rest " + acmd(st.rested_ms);
     }
-    function btn(st, label){
+    function btn(st, label, handler, secondary){
       const b = document.createElement("button");
+      if(secondary) b.className = "secondary";
       b.textContent = label;
-      b.onclick = startOrToggle;
+      b.onclick = handler || startOrToggle;
       $("#wactions").appendChild(b);
     }
 
@@ -327,27 +414,36 @@
       try{
         const r = await fetch("/api/work",{method:"POST",headers:{"Content-Type":"application/json"},
           body:JSON.stringify({action:"tick", delta_ms: delta})});
+        const prev = WK.st;
         const j = await r.json();
-        if(j){ WK.st = j; }
+        if(j){ WK.st = j; onStateChange(prev, j, false); }
       }catch(e){ WK.pending += delta; }
     }
 
-    async function startOrToggle(){
-      const act = (WK.st && (WK.st.session==="working" || WK.st.session==="resting")) ? "pause"
-                : (WK.st && WK.st.session==="paused") ? "resume" : "start";
+    // ---------- actions ----------
+    async function wAct(act){
+      audioCtx();
       try{
         const r = await fetch("/api/work",{method:"POST",headers:{"Content-Type":"application/json"},
           body:JSON.stringify({action:act})});
         const j = await r.json();
         if(j && !r.ok){ $("#wstatus").textContent = "⚠ " + (j.error||"request failed"); }
+        if(act === "start" || act === "resume") stopChimeLoop();   // your answer ends the ringing
       }catch(e){}
       if(act==="start" || act==="resume"){ if(!WK.timer) startTicking(); }
       else { stopTicking(); }
       wLoad();
     }
+    function startOrToggle(){
+      const s = WK.st || {};
+      const act = (s.session==="working" || s.session==="resting") ? "pause"
+                : (s.session==="paused" || s.session==="waiting") ? "resume" : "start";
+      wAct(act);
+    }
 
     $("#wgoalet").addEventListener("click", setGoal);
     $("#winter").addEventListener("click", setIntervals);
+    $("#wtone").addEventListener("click", ()=>{ audioCtx(); chimeBreakStart(); });
     $("#wgoal").addEventListener("keydown", e=>{ if(e.key==="Enter") setGoal(); });
     $("#wwork").addEventListener("keydown", e=>{ if(e.key==="Enter") setIntervals(); });
     $("#wrest").addEventListener("keydown", e=>{ if(e.key==="Enter") setIntervals(); });
@@ -355,7 +451,7 @@
     $("#cname").addEventListener("keydown", e=>{ if(e.key==="Enter"){ e.preventDefault(); addCard(); } });
 
     wLoad();
-    setInterval(wLoad, 5000);   // picks up penalty expiry + 00:00 refresh while the page stays open
+    setInterval(wLoad, 5000);   // keeps state (and the chime loop) alive while the page stays open
   </script>
 </body>
 </html>

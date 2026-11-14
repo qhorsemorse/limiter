@@ -340,8 +340,6 @@ class Handler(BaseHTTPRequestHandler):
                 st = w.set_goal(rec.get("ms"))
             elif action == "set_interval":
                 st = w.set_interval(rec.get("work_ms"), rec.get("rest_ms"))
-            elif action == "set_penalty":
-                st = w.set_penalty(rec.get("ms"))
             elif action == "set_active_card":
                 st = w.set_active_card(rec.get("cid"))
             elif action == "start":
@@ -514,14 +512,14 @@ def main():
                       + time.strftime("%H:%M:%S", time.localtime(_wst["reward_until_ms"] / 1000.0)))
     except Exception as e:
         print("[!] workout restore failed:", e)
-    # Restore an in-progress/pungished work focus window across restarts (the
+    # Restore an in-progress work focus window across restarts (the
     # block-eom-thing window itself lives in data/work.json; the in-memory flag
     # does not, and without this a restart mid-session would un-block everything).
     try:
         _wku = get_work().status().get("work_until_ms", 0) or 0
         if _wku:
             store.set_work_until(_wku)
-            print("[+] work focus/penalty block restored until "
+            print("[+] work focus block restored until "
                   + time.strftime("%H:%M:%S", time.localtime(_wku / 1000.0)))
     except Exception as e:
         print("[!] work restore failed:", e)

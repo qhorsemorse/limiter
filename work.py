@@ -1,6 +1,6 @@
 """Work / focus-session feature (server-side, calendar-day aware, cheat-resistant).
 
-CONCEPT (v6 — pomodoro goal timer):
+CONCEPT (v7 — pomodoro goal timer with chimes, no self-locking):
 
   * You set a DAILY GOAL: the amount of real work-time (ms) you want to reach
     in one day ("I will work 5 hours today"). Set via the UI or
@@ -10,19 +10,28 @@ CONCEPT (v6 — pomodoro goal timer):
   * You set the POMODORO stretches: the work-stretch length and the
     rest-stretch length (defaults 50 min / 10 min). Set via the UI or
     POST /api/work {action:"set_interval", work_ms, rest_ms}. Also persisted.
-  * Start runs the timer in cycles: WORK stretch -> REST stretch -> WORK -> ...
-    until the goal is reached.
+  * Start runs ONE work stretch; the rhythm is server-anchored and chime-marked:
       - WORK stretch: the gateway blocks EVERY domain (focus mode — there is
         nowhere to be distracted). Only real time inside work stretches is
         credited to the goal ("subtracted" from it).
+      - The work is done (stretch end): the REST stretch starts AUTOMATICALLY.
+        The client plays the "time for a break" chime on this transition.
       - REST stretch: the block is OFF (you may genuinely rest / browse).
         Rest minutes are recorded (rested_ms) but never credited to the goal.
+      - The break is over (rest end): the session stops in WAITING. The next
+        work stretch does NOT start automatically — the client plays the
+        "break over" chime and keeps LOOPING it until you RESUME (which starts
+        a fresh work stretch) or PAUSE (which silences the waiting state; a
+        later resume starts the work stretch then).
+    So the day's rhythm is: [START] work → break → (chime loop) work → break
+    → (chime loop) … — every work stretch is started deliberately.
   * GOAL REACHED (accrued work >= goal) -> session SUCCESS: the block clears,
-    you are done for the day.
-  * A day that ENDS (local 00:00) with the session still active and the goal
-    NOT reached -> session FAILURE: a penalty window arms (everything stays
-    blocked for penalty_ms), the day is logged as failed, and no new session
-    can start that day (renews at 00:00).
+    you are done for the day (the client plays a chime on this transition too).
+  * A day that ENDS (local 00:00) with the goal NOT reached is simply LOGGED
+    as a failed day in the work data — and a fresh IDLE day starts. The timer
+    is NEVER locked by this: there is no failure state and no penalty window
+    that blocks the timer or the apps (removed in v7 — the penalty was a
+    mistaken design; a missed goal must not hold you).
   * WORK DATA: every day is recorded in the "log" list inside data/work.json:
       {"date","goal_ms","worked_ms","rested_ms","cycles","done","failed"}
     It is stored for now and included in GET /api/work; a dedicated progress
@@ -35,10 +44,13 @@ Cheat resistance (same philosophy as the workout):
     ends at the moment it should), so the cycle rhythm neither drifts nor
     shifts when the client lags, closes the tab or the gateway restarts.
     status() (and every action) auto-advances phases that expired in real
-    time, so the resolver's block window follows the real rhythm.
+    time, so the resolver's block window follows the real rhythm. WAITING and
+    PAUSED deliberately never auto-advance (they sit until the user acts).
 
-States: idle -> working -> resting -> working -> ... -> success | failed
-("paused" freezes the whole cycle — remaining phase time is remembered).
+States: idle -> working -> resting -> waiting -> (resume) working -> ...
+        -> success
+("paused" freezes the current phase — remaining phase time is remembered; a
+ pause while WAITING just silences it — the block stays off the whole time).
 
 Compared against the workout, the deliberate differences:
   * The workout is a *hover* timer whose reward UN-blocks everything. The Work
@@ -47,11 +59,26 @@ Compared against the workout, the deliberate differences:
     off Store.set_work_until()/work_active().
   * The workout has one duration per day. Work has a daily goal (settable) plus
     work/rest pomodoro lengths (settable), shared work *cards* (task kinds) for
-    attributing the credited time, a per-day work-data log, and a penalty
-    window when a day ends with the goal unmet.
+    attributing the credited time, and a per-day work-data log.
 
 State persists to data/work.json (like workout.json) so gateway restarts don't
-lose progress, the log or a pending penalty/window.
+lose progress, the log or a pending phase.
+
+CHANGELOG v6 -> v7 (user request, 2026-11-14):
+  * REMOVED the "day-end failure / penalty" self-lock: when 00:00 catches the
+    session active with the goal unmet, the day is only LOGGED as failed and
+    the new day starts IDLE. No "failed" session exists anymore, there is no
+    penalty block window and no "set_penalty" action — a missed goal never
+    blocks the timer or the apps. Legacy state files stuck in the old "failed"
+    session are healed to "idle" on load.
+  * REST no longer auto-chains into the next WORK stretch: it ends in the new
+    "waiting" state. The work.html client plays/loops the "break over" chime
+    there until the user resumes (fresh work stretch) or pauses (silence).
+    The status exposes "awaiting_work" (true in waiting, or in a paused
+    waiting) so the UI knows to ring.
+  * The "work over" (working -> resting, or working -> success) and "break
+    over" (resting -> waiting) transitions are the chime points the UI listens
+    for; the server just flips states, the browser does the ringing.
 """
 import json, os, threading, time
 
@@ -61,10 +88,10 @@ DEFAULT_WORK_MS = int(os.environ.get("WORK_INTERVAL_MS", 50 * 60 * 1000))       
 DEFAULT_REST_MS = int(os.environ.get("WORK_REST_MS", 10 * 60 * 1000))            # default rest stretch (10m)
 MIN_WORK_MS = int(os.environ.get("MIN_WORK_INTERVAL_MS", 60 * 1000))             # work stretch floor (1m)
 MAX_PHASE_MS = int(os.environ.get("MAX_WORK_PHASE_MS", 4 * 3600 * 1000))         # per-stretch cap (4h)
-DEFAULT_PALTY_MS = int(os.environ.get("WORK_PALTY_MS", 30 * 60 * 1000))          # penalty on failure (30m)
 MAX_MS = 8 * 3600 * 1000          # 8 h sanity cap for any time value
 _MAX_DELTA_MS = 5000.0            # client sanity cap per single tick
 _MAX_ADVANCE_STEPS = 200          # catch-up loop cap (tiny stretches + huge gap)
+_VALID_SESSIONS = ("idle", "working", "resting", "waiting", "paused", "success")
 
 
 def _clamp(v, lo, hi):
@@ -96,6 +123,18 @@ class Work:
                     st["goal_ms"] = st["limit_ms"]
                 st.pop("limit_ms", None)
                 st.pop("budget_ms", None)
+                # one-way migration from the v6 "day-end failure" self-lock
+                # (removed in v7): a stuck "failed" session must never hold the
+                # timer — heal it to idle — and drop the legacy penalty fields.
+                # (The day it belongs to still gets its "failed" data flag via
+                # day_ended_active when _maybe_reset finalizes it.)
+                if st.get("session") not in _VALID_SESSIONS:
+                    st["session"] = "idle"
+                    st["day_ended_active"] = True
+                if st.get("session") != "paused":
+                    st.pop("wait_work", None)
+                st.pop("penalty_until_ms", None)
+                st.pop("penalty_ms", None)
                 st.setdefault("log", [])
                 return st
         except Exception:
@@ -127,7 +166,8 @@ class Work:
     @staticmethod
     def _midnight_after(now_ms):
         """The NEXT local 00:00 strictly after now, in ms. Used as a
-        conservative 'block until the day ends'."""
+        conservative 'block until the day ends' (paused inside a work
+        stretch)."""
         t = now_ms / 1000.0
         y, m, d = time.localtime(t)[:3]
         nxt = time.mktime((y, m, d, 0, 0, 0, 0, 0, 0))
@@ -138,20 +178,19 @@ class Work:
     def _blank(self, date):
         return {
             "date": date,
-            "session": "idle",          # idle|working|resting|paused|success|failed
+            "session": "idle",          # idle|working|resting|waiting|paused|success
             "phase": "work",            # the phase the (running or paused) cycle is in
             "phase_end_ms": None,       # wall ms at which the current phase expires
             "phase_left_ms": None,      # remaining ms of the phase (only while paused)
+            "wait_work": None,          # True: this pause happened while WAITING for work
             "accrued_ms": 0.0,          # real WORK minutes credited to the goal today
             "rested_ms": 0.0,           # real REST minutes spent today
             "cycles": 0,                # work stretches completed today
             "session_start_ms": None,
             "last_tick_ms": None,
-            "penalty_until_ms": None,
             "goal_ms": DEFAULT_GOAL_MS,
             "work_ms": DEFAULT_WORK_MS,
             "rest_ms": DEFAULT_REST_MS,
-            "penalty_ms": DEFAULT_PALTY_MS,
         }
 
     def _log_day(self, date, goal, worked, rested, cycles, done, failed):
@@ -169,10 +208,13 @@ class Work:
         log.append(rec)
 
     def _maybe_reset(self, now=None):
-        """At local 00:00: finalize the previous day in the log, ARM THE PENALTY
-        if the day ended with the session still active and the goal unmet, and
-        start a fresh day. The SETPOINTS (goal / work & rest stretches /
-        penalty) and the cards PERSIST — they are long-lived, not daily state."""
+        """At local 00:00: finalize the previous day in the log and start a
+        fresh IDLE day. A day that ended with the goal unmet is ONLY logged as
+        failed (stored work data) — v7 has deliberately NO failure state and no
+        penalty: a missed goal must never lock the timer or block the apps, so
+        the new day is always startable right away. The SETPOINTS (goal /
+        work & rest stretches) and the cards PERSIST — they are long-lived, not
+        daily state."""
         now = now if now is not None else self._now_ms()
         today = self._today(now)
         st = self.state
@@ -180,27 +222,24 @@ class Work:
             return
         prev = st.get("date")
         if prev:
-            # finalize the day that just ended (an already-failed day is left
-            # as-is — it was logged when the penalty first armed)
+            # finalize the day that just ended (a missed goal stays a stored
+            # fact in the log — it changes nothing about the new day)
+            ended_active = st.get("session") in ("working", "resting", "paused", "waiting") \
+                or bool(st.pop("day_ended_active", False))
             self._log_day(date=prev, goal=self._goal(st),
                           worked=float(st.get("accrued_ms", 0.0)),
                           rested=float(st.get("rested_ms", 0.0)),
                           cycles=int(st.get("cycles", 0)),
                           done=st.get("session") == "success",
-                          failed=st.get("session") in ("working", "resting", "paused"))
+                          failed=ended_active
+                                  and float(st.get("accrued_ms", 0.0)) < self._goal(st))
         fresh = self._blank(today)
         fresh["goal_ms"] = st.get("goal_ms", fresh["goal_ms"])
         fresh["work_ms"] = st.get("work_ms", fresh["work_ms"])
         fresh["rest_ms"] = st.get("rest_ms", fresh["rest_ms"])
-        fresh["penalty_ms"] = st.get("penalty_ms", fresh["penalty_ms"])
         fresh["cards"] = st.get("cards", [])
         fresh["active_card_id"] = st.get("active_card_id")
         fresh["log"] = st.get("log", [])
-        if st.get("date") and st.get("session") in ("working", "resting", "paused") \
-                and float(st.get("accrued_ms", 0.0)) < self._goal(st):
-            # you committed to the day and it ended with the goal unmet
-            fresh["session"] = "failed"
-            fresh["penalty_until_ms"] = int(now + self._penalty())
         self.state = fresh
         self._save()
 
@@ -217,17 +256,17 @@ class Work:
         st = st if st is not None else self.state
         return int(_clamp(st.get("rest_ms", DEFAULT_REST_MS), 0, MAX_PHASE_MS))
 
-    def _penalty(self):
-        return int(_clamp(self.state.get("penalty_ms", DEFAULT_PALTY_MS), 0, MAX_MS))
-
     # ---------- phase machine (wall-clock anchored) ----------
     def _advance(self, now):
         """Advance the work/rest cycle to where it IS in real time. Phase
         boundaries are anchored to the server wall clock, so a late client or a
         gateway restart cannot shift the rhythm — a phase expired at the moment
-        it should, and the next one follows the old boundary. Returns True if
-        the state changed (the caller saves). Only runs while working/resting.
-        CALLER MUST HOLD self.lock."""
+        it should. Transitions (v7): WORK end -> REST starts AUTOMATICALLY (the
+        client chimes "time for a break"); REST end -> WAITING (the next work
+        stretch waits for the user — the client rings the "break over" chime in
+        a loop until resume/pause). Only runs while working/resting; WAITING
+        and PAUSED sit still by design. Returns True if the state changed (the
+        caller saves). CALLER MUST HOLD self.lock."""
         st = self.state
         if st.get("session") not in ("working", "resting"):
             return False
@@ -244,30 +283,32 @@ class Work:
                 if float(st.get("accrued_ms", 0.0)) >= self._goal(st):
                     # the work stretch is over AND the goal is in -> SUCCESS
                     st["session"] = "success"
-                    st["penalty_until_ms"] = None
+                    st["phase_end_ms"] = None
                     self._log_day(st["date"], self._goal(st), float(st.get("accrued_ms", 0.0)),
                                   float(st.get("rested_ms", 0.0)), int(st.get("cycles", 0)),
                                   done=True, failed=False)
                     changed = True
                     break
+                # the work is done -> the break starts AUTOMATICALLY
                 st["session"] = "resting"
                 st["phase"] = "rest"
                 st["cycles"] = int(st.get("cycles", 0)) + 1
                 st["phase_end_ms"] = boundary + self._rest_len(st)
-            else:  # resting -> working
-                st["session"] = "working"
+            else:  # resting -> waiting: the work stretch does NOT auto-start
+                st["session"] = "waiting"
                 st["phase"] = "work"
-                st["phase_end_ms"] = boundary + self._work_len(st)
+                st["phase_end_ms"] = None
+                st["phase_left_ms"] = 0
             changed = True
         return changed
 
     # ---------- "block everything" window (mirrors workout reward window) ----------
     def _active_until_locked(self, now):
         """Epoch ms until which everything must be blocked (0 = do NOT block),
-        computed from the current session state. Conservative on purpose: when
-        the exact end is unknowable (paused inside a work stretch, failed), it
-        keeps blocking until a resume / day end rather than unlocking early.
-        CALLER MUST HOLD self.lock (invoked from within status())."""
+        computed from the current session state. Only a live (or paused
+        mid-stretch) WORK window blocks; rests, waiting and a silenced waiting
+        never hold the block. CALLER MUST HOLD self.lock (invoked from within
+        status())."""
         st = self.state
         session = st.get("session", "idle")
         if session == "working":
@@ -275,15 +316,15 @@ class Work:
             # end, even if the client goes quiet (the phase machine auto-advances
             # on the next status/action).
             return int(st.get("phase_end_ms") or 0)
-        if session == "resting":
+        if session == "resting" or session == "waiting":
             return 0
         if session == "paused":
+            if st.get("wait_work"):
+                # paused while WAITING between stretches -> nothing blocks
+                return 0
             # paused inside a work stretch -> the block holds until you resume
             # (or the day ends); paused inside rest -> everything is already off.
             return self._midnight_after(now) if st.get("phase") == "work" else 0
-        if session == "failed":
-            pu = float(st.get("penalty_until_ms") or 0)
-            return int(pu) if pu > now else 0
         # idle / success -> nothing to block
         return 0
 
@@ -291,7 +332,9 @@ class Work:
     def status(self, now_ms=None):
         """Snapshot. Also (a) finalizes a new calendar day and (b) advances the
         phase machine to now, so the display and the resolver's block window
-        stay correct even while the client is quiet."""
+        stay correct even while the client is quiet. "awaiting_work" tells the
+        UI it must be ringing the "break over" chime (waiting, or a silenced
+        waiting)."""
         with self.lock:
             now = now_ms if now_ms is not None else self._now_ms()
             self._maybe_reset(now)
@@ -300,10 +343,8 @@ class Work:
             st = self.state
             goal = self._goal(st)
             session = st.get("session", "idle")
-            penalty_until = float(st.get("penalty_until_ms") or 0)
-            penalty_active = bool(penalty_until and now < penalty_until)
             phase_end = float(st.get("phase_end_ms") or 0)
-            phase = st.get("phase") if session in ("working", "resting", "paused") else None
+            phase = st.get("phase") if session in ("working", "resting", "waiting", "paused") else None
             if session == "paused":
                 phase_left = int(st.get("phase_left_ms") or 0)
             elif session in ("working", "resting"):
@@ -316,18 +357,15 @@ class Work:
                 "session": session,
                 "phase": phase,                              # "work"|"rest"|None
                 "phase_left_ms": phase_left,
+                "awaiting_work": session == "waiting" or (session == "paused" and bool(st.get("wait_work"))),
                 "goal_ms": goal,
                 "work_interval_ms": self._work_len(st),
                 "rest_interval_ms": self._rest_len(st),
-                "penalty_ms": self._penalty(),
                 "accrued_ms": int(accrued),
                 "remaining_goal_ms": int(max(0, goal - accrued)),
                 "rested_ms": int(float(st.get("rested_ms", 0.0))),
                 "cycles": int(st.get("cycles", 0)),
                 "complete": session == "success",
-                "failed": session == "failed",
-                "penalty_active": penalty_active,
-                "penalty_left_ms": int(max(0, penalty_until - now)),
                 "cards": [dict(c) for c in st.get("cards", [])],
                 "active_card_id": st.get("active_card_id"),
                 # block-eom-thing window for the store to pick up (0 = off)
@@ -381,7 +419,7 @@ class Work:
             if st.get("session") in ("working", "resting", "paused") \
                     and float(st.get("accrued_ms", 0.0)) >= self._goal(st):
                 st["session"] = "success"
-                st["penalty_until_ms"] = None
+                st["phase_end_ms"] = None
                 self._log_day(st["date"], self._goal(st), float(st.get("accrued_ms", 0.0)),
                               float(st.get("rested_ms", 0.0)), int(st.get("cycles", 0)),
                               done=True, failed=False)
@@ -393,7 +431,7 @@ class Work:
         (block on, minutes count toward the goal); rest_ms = length of a rest
         stretch (block off, nothing counts). The stretch currently in progress
         keeps its remaining time; the new lengths apply from the NEXT stretch.
-        rest may be 0 (keep working with no breaks)."""
+        rest may be 0 (straight to the waiting chime after the work stretch)."""
         with self.lock:
             self._maybe_reset()
             st = self.state
@@ -401,15 +439,6 @@ class Work:
                 st["work_ms"] = max(MIN_WORK_MS, int(_clamp(work_ms, MIN_WORK_MS, MAX_PHASE_MS)))
             if rest_ms is not None:
                 st["rest_ms"] = int(_clamp(rest_ms, 0, MAX_PHASE_MS))
-            self._save()
-            return self.status()
-
-    def set_penalty(self, new_ms):
-        """Adjust the penalty window length (failure penalty). Clamped to a
-        sane floor (1 min)."""
-        with self.lock:
-            self._maybe_reset()
-            self.state["penalty_ms"] = int(_clamp(new_ms, 60 * 1000, MAX_MS))
             self._save()
             return self.status()
 
@@ -424,50 +453,89 @@ class Work:
             st["phase"] = "work"
             st["phase_end_ms"] = int(now + self._work_len(st))
             st["phase_left_ms"] = None
+            st["wait_work"] = None
             st["session_start_ms"] = now
             st["last_tick_ms"] = now
-            st["penalty_until_ms"] = None
             self._save()
             return self.status()
 
     def pause(self):
+        """Freeze the running session, OR silence a ringing WAITING state. In
+        both cases the block is released (a pause never holds the block on its
+        own); a pause inside a work stretch keeps it only because the focus
+        block must not leak — see _active_until_locked."""
         with self.lock:
             self._maybe_reset()
             st = self.state
-            if st.get("session") in ("working", "resting"):
-                now = self._now_ms()
+            session = st.get("session")
+            now = self._now_ms()
+            if session == "waiting":
+                # pause while waiting (between stretches): silence, nothing
+                # blocks; a later resume starts the work stretch THEN
+                st["session"] = "paused"
+                st["phase"] = "work"
+                st["phase_left_ms"] = 0
+                st["wait_work"] = True
+                st["last_tick_ms"] = now
+                self._save()
+            elif session in ("working", "resting"):
                 st["phase_left_ms"] = max(0, int(float(st.get("phase_end_ms") or 0) - now))
                 st["session"] = "paused"
+                st["wait_work"] = None
                 st["last_tick_ms"] = now
                 self._save()
             return self.status()
 
     def resume(self):
+        """Resume a pause (restoring the frozen stretch — or, for the next
+        stretch, starting it fresh from the server clock), or start the next
+        WORK stretch straight from a ringing WAITING state."""
         with self.lock:
             self._maybe_reset()
             st = self.state
+            now = self._now_ms()
             if st.get("session") == "paused":
-                now = self._now_ms()
-                left = int(st.get("phase_left_ms") or 0)
-                if left <= 0:
-                    # the frozen stretch expired while paused: start the NEXT
-                    # stretch fresh from the server clock
-                    st["phase_end_ms"] = int(now + (self._rest_len(st) if st.get("phase") == "work"
-                                                    else self._work_len(st)))
+                if st.get("wait_work"):
+                    # resumed a SILENCED WAITING (between stretches): start the
+                    # next work stretch fresh from the server clock
+                    st["session"] = "working"
+                    st["phase"] = "work"
+                    st["phase_end_ms"] = int(now + self._work_len(st))
+                    st["phase_left_ms"] = None
+                    st["wait_work"] = None
+                    st["last_tick_ms"] = now
                 else:
-                    st["phase_end_ms"] = now + left
+                    left = int(st.get("phase_left_ms") or 0)
+                    if left <= 0:
+                        # the frozen stretch expired while paused: start the NEXT
+                        # stretch fresh from the server clock
+                        st["phase_end_ms"] = int(now + (self._rest_len(st) if st.get("phase") == "work"
+                                                        else self._work_len(st)))
+                    else:
+                        st["phase_end_ms"] = now + left
+                    st["phase_left_ms"] = None
+                    st["session"] = "resting" if st.get("phase") == "rest" else "working"
+                    st["wait_work"] = None
+                    st["last_tick_ms"] = now
+            elif st.get("session") == "waiting":
+                # the break is over and the user chose to work NOW
+                st["session"] = "working"
+                st["phase"] = "work"
+                st["phase_end_ms"] = int(now + self._work_len(st))
                 st["phase_left_ms"] = None
-                st["session"] = "resting" if st.get("phase") == "rest" else "working"
+                st["wait_work"] = None
                 st["last_tick_ms"] = now
-                if self._advance(now):
-                    self._save()
+            self._save()
+            if self._advance(now):
+                self._save()
             return self.status()
 
     def tick(self, delta_ms):
         """Credit real time for the current phase (capped by REAL elapsed
         wall-clock since the last tick): a work stretch credits the GOAL (and
         the focused card), a rest stretch credits the rest-time. Also advances
-        the phase machine to now. Returns (snapshot, error_string_or_None)."""
+        the phase machine to now. Waiting/paused/idle sessions credit nothing
+        (they are not running). Returns (snapshot, error_string_or_None)."""
         now = self._now_ms()
         with self.lock:
             self._maybe_reset(now)
@@ -476,7 +544,7 @@ class Work:
             if session == "success":
                 return self.status(), None
             if session not in ("working", "resting"):
-                return self.status(), "work not started (call start first)"
+                return self.status(), "work not running (start it, or resume the waiting chime)"
             try:
                 delta_ms = float(delta_ms)
             except (TypeError, ValueError):
@@ -504,7 +572,7 @@ class Work:
             if session == "working" and float(st.get("accrued_ms", 0.0)) >= self._goal(st):
                 # reached the goal mid-stretch -> SUCCESS (block cleared by caller)
                 st["session"] = "success"
-                st["penalty_until_ms"] = None
+                st["phase_end_ms"] = None
                 self._log_day(st["date"], self._goal(st), float(st.get("accrued_ms", 0.0)),
                               float(st.get("rested_ms", 0.0)), int(st.get("cycles", 0)),
                               done=True, failed=False)

@@ -67,24 +67,30 @@ Firefox (DoH, locked to 127.0.0.1:8443)
   non-stackable.
 
 * **Work / focus session** (daily — a *sibling* of the workout but the opposite
-  intent, now a **pomodoro goal timer**). You set a **daily goal** (the amount of
-  real work-time you want to reach in a day, e.g. 5 h of actual work — the
-  default) plus the **work stretch** and **rest stretch** lengths (defaults
-  50 / 10 minutes) — all settable in the UI or API and stored. Start runs the timer in
-  cycles: during a **work stretch** the gateway blocks **everything** (both
-  time-limits and absolute limits — nowhere to get distracted) and the real
-  minutes inside it are credited to the goal; during a **rest stretch** the
-  block is **off** (a genuine break) and the rest minutes are only *recorded*,
-  never credited. Goal reached → done for the day, block clears. A day that ends
-  at 00:00 with the session still active and the goal unmet → **failure**: a
-  penalty window blocks everything until it expires, the day is logged as
-  failed, and no new session starts until 00:00. Every day is stored in the
-  work-data log inside `data/work.json` (`goal_ms / worked_ms / rested_ms /
-  cycles / done / failed`) — available in `GET /api/work` for a progress UI to
-  display later. Work cards (tasks of different kinds) attribute the credited
-  time. Cheat resistance matches the workout: credit is capped by the real
-  elapsed wall-clock between ticks, and phase boundaries are anchored to server
-  time, so the rhythm can't be fast-forwarded or shifted.
+  intent, now a **pomodoro goal timer with chimes**). You set a **daily goal**
+  (the amount of real work-time you want to reach in a day, e.g. 5 h of actual
+  work — the default) plus the **work stretch** and **rest stretch** lengths
+  (defaults 50 / 10 minutes) — all settable in the UI or API and stored. Start
+  runs the timer in cycles: during a **work stretch** the gateway blocks
+  **everything** (both time-limits and absolute limits — nowhere to get
+  distracted) and the real minutes inside it are credited to the goal; when the
+  work is done the **rest stretch starts automatically** (the page plays a
+  "time for a break" chime). During a **rest stretch** the block is **off** (a
+  genuine break) and the rest minutes are only *recorded*, never credited. When
+  the break is over the timer goes to **WAITING**: the next work stretch does
+  **not** start by itself — the page plays a second "break over" chime and keeps
+  **looping it (every 10 s) until work is resumed (fresh work stretch) or
+  paused (silence)**. Goal reached → done for the day, block clears (chime too).
+  A day that ends at 00:00 with the goal unmet is only **logged as failed** in
+  the work data — the new day starts idle and the timer is **never locked** by
+  a missed goal (no failure state, no penalty window; the old self-locking
+  penalty was removed). Every day is stored in the work-data log inside
+  `data/work.json` (`goal_ms / worked_ms / rested_ms / cycles / done /
+  failed`) — available in `GET /api/work` for a progress UI to display later.
+  Work cards (tasks of different kinds) attribute the credited time. Cheat
+  resistance matches the workout: credit is capped by the real elapsed
+  wall-clock between ticks, and phase boundaries are anchored to server time,
+  so the rhythm can't be fast-forwarded or shifted.
 
 ---
 
@@ -152,11 +158,11 @@ curl -s --cacert /home/pietro/limiter/certs/ca.pem -H 'Content-Type: application
 | `doh.py` | TLS DNS-over-HTTPS responder (RFC 8484, wire + JSON) — the browser front-door |
 | `bypass.py` | Bypass detection (VPN peers, public-DoH sockets, Firefox process/sockets, lock-file check) + optional iptables rules (used only with `--bypass-protect`) |
 | `workout.py` | Daily workout/reward state machine (calendar-day rollover, wall-clock-capped credit, 25-min floor, √x·ln(x)·0.9 reward) |
-| `work.py` | Daily *pomodoro goal* state machine (settable daily goal + work/rest stretches, wall-clock-credited work-time, block only during work stretches, day-end failure + penalty, per-day work-data log) |
+| `work.py` | Daily *pomodoro goal* state machine (settable daily goal + work/rest stretches, wall-clock-credited work-time, block only during work stretches, auto-rest + chime-marked WAITING state, day-end short-goal logged only (no self-lock/penalty), per-day work-data log) |
 | `db.py` | sqlite schema/helpers (`limits` table incl. one-directional add-only domain append) |
 | `index.html` | page 1 — limits + bypass override (Home nav button) |
 | `workout.html` | page 2 — daily workout card (Workout nav button) |
-| `work.html` | page 3 — daily work pomodoro goal (Work nav button): goal + stretch settings, work/rest dial, start/pause/resume, task cards, penalty |
+| `work.html` | page 3 — daily work pomodoro goal (Work nav button): goal + stretch settings, work/rest dial, start/pause/resume, task cards, WebAudio chimes (break start + looping break-over, test-chime button) |
 | `secondary_index.html` | child view served by `secondary.py` — nuclear/offline status, READ-ONLY central limits view, stats, workout nav |
 | shared `.topnav` | links between the pages; highlights the current page. No JS routing — static HTML files + routes in app.py/secondary.py.
 | `remote_store.py` | **NEW** — `CacheDB` (local copy of central `limits`) + `RemoteStore` (cache-first / staleness-TTL / offline-emergency semantics) |
@@ -165,7 +171,7 @@ curl -s --cacert /home/pietro/limiter/certs/ca.pem -H 'Content-Type: application
 | `run_secondary.py` | **NEW** — thin launcher → `secondary.py` (symmetric role entrypoint) |
 | `test_remote_store.py` | **NEW** — `RemoteStore` unit/integration tests vs a live central-only `app.py` (sync, cache-copy, staleness re-fetch, `report_access`, offline emergency) |
 | `test_secondary.py` | **NEW** — end-to-end: central(central-only) + stub upstream + secondary driving real DoH wire queries (blocked/forwarded, detect arms grace centrally) |
-| `test_work.py` | Work/pomodoro-goal feature tests (unit for the state machine + live end-to-end: free domain blocked during work stretches, un-blocked during rests, re-blocked next stretch, success, day-end failure + penalty window) |
+| `test_work.py` | Work/pomodoro-goal feature tests (unit for the state machine + live end-to-end: free domain blocked during work stretches, un-blocked during rests, WAITING state keeps it un-blocked, re-blocked on resume, success, day-end short-goal logs a fresh idle day, legacy "failed" state heals) |
 | `tools/` | Setup & maintenance scripts (see §5) — incl. `limiter-central.service` + `install_central.sh` |
 | `test_limit.py` | Per-limit, one-directional (add-only) domain management: unit (`Store.add_domains`) + live HTTP integration (create/append/dedup + the guarantee that no delete/remove-domain endpoint exists) |
 | `test_*.py` | 9 test suites (engine, dns, doh, app, bypass, remote_store, secondary, work, limit) — plain `python3 test_x.py` |
@@ -222,14 +228,16 @@ Restart Firefox after step 2/3 so the profile settings apply.
   Unblock-all until the cause is fixed, or click **Override** if you dealt with
   it. State + reason visible in `/api/bypass`.
 * **Work**: the Work page is a pomodoro goal timer. Set the daily goal (minutes of
-  real work) and the work/rest stretch lengths in the UI or via `POST /api/work`
-  (`set_goal`, `set_interval`), then Start / Pause / Resume. Work stretches block
-  every site and credit the goal; rest stretches unblock everything (a real
-  break) and are only recorded, never credited. Reaching the goal finishes the
-  day; a day that ends at 00:00 without it arms a penalty window. Each day's work
-  data (goal, worked, rested, stretches, done/failed) is stored in
-  `data/work.json` and served by `GET /api/work`. Work cards (tasks) attribute
-  the credited time.
+   real work) and the work/rest stretch lengths in the UI or via `POST /api/work`
+   (`set_goal`, `set_interval`), then Start / Pause / Resume. Work stretches block
+   every site and credit the goal; when the work is done the rest stretch starts
+   automatically (chime). When the break is over the timer WAITS: a second chime
+   rings and keeps looping (every 10 s) until you Resume (starts the next work
+   stretch) or Pause (silence). Reaching the goal finishes the day (chime).
+   A day that ends at 00:00 short of the goal is only logged as failed — the
+   timer is never locked, no penalty. Each day's work data (goal, worked,
+   rested, stretches, done/failed) is stored in `data/work.json` and served by
+   `GET /api/work`. Work cards (tasks) attribute the credited time.
 * **Workout**: big timer on the UI. Hover it to run; move away to pause.
   Before the first hover you may pick a longer duration (minimum **25 min**);
   hovering locks the choice until 00:00. The timer must reach **zero** — a
@@ -302,10 +310,9 @@ Work/pomodoro-goal env vars (optional; defaults in brackets), analogous to the w
 `WORK_INTERVAL_MS [3000000]` (default work-stretch length, ms = 50 min),
 `WORK_REST_MS [600000]` (default rest-stretch length, ms = 10 min; may be set to 0),
 `MIN_WORK_INTERVAL_MS [60000]` (hard floor of a work stretch, ms — lowered only for tests),
-`MAX_WORK_PHASE_MS [14400000]` (cap for either stretch length, ms = 4 h),
-`WORK_PALTY_MS [1800000]` (default penalty window length on day-end failure, ms).
+`MAX_WORK_PHASE_MS [14400000]` (cap for either stretch length, ms = 4 h).
 
-State files: `data/limits.db` (limits), `data/workout.json` (daily workout/reward), `data/work.json` (daily work goal/session/penalty + stored per-day work-data log),
+State files: `data/limits.db` (limits), `data/workout.json` (daily workout/reward), `data/work.json` (daily work goal/session + stored per-day work-data log),
 `data/browsers_locked.txt` (what the browser lock touched), `data/gateway.log`
 (nohup-run logs; under systemd the log is the journal: `journalctl --user -u limiter`).
 
@@ -314,7 +321,7 @@ API (JSON): `GET /api/limits`, `POST /api/limits`, `DELETE /api/limits/<id>`,
 `POST /api/limits/<id>/domains {domains:[...]}` (ADD domains only — one-directional, see §7),
 `GET /api/bypass`, `POST /api/bypass/override {enabled}`, `GET /api/stats`,
 `GET /api/workout`, `POST /api/workout {action: start|tick|redeem|set_duration {ms}}`,
-`GET /api/work` (incl. the stored per-day work-data `log`), `POST /api/work {action: add_card|remove_card|set_goal {ms}|set_interval {work_ms?, rest_ms?}|set_penalty|set_active_card|start|pause|resume|tick}`, `GET /api/health`.
+`GET /api/work` (incl. the stored per-day work-data `log`), `POST /api/work {action: add_card|remove_card|set_goal {ms}|set_interval {work_ms?, rest_ms?}|set_active_card|start|pause|resume|tick}`, `GET /api/health`.
 
 ## 7. Security notes & known limits (be honest about these)
 
@@ -375,7 +382,7 @@ security alarm).
   (`test_limit.py`). It is wired via `db.append_domains_to_limit` + `Store.add_domains`,
   and is one-directional: `POST /api/limits/<id>/domains` only appends — there is no
   remove/delete-domain endpoint, so undoing an add needs a hand-edit of the hidden DB.
-* **Work / pomodoro-goal feature is implemented and tested** (rewritten `work.py`, `work.html`, `test_work.py`; wired into `app.py` and `secondary.py` via the store's block-e window, now re-synced on every `GET /api/work` too). A settable **daily goal** + work/rest **stretch** lengths; the resolver blocks every domain during work stretches and un-blocks during rests; work-time is credited to the goal (capped by real elapsed wall-clock, phase boundaries anchored to server time); goal reached → done, day ending short → penalty window. A per-day work-data `log` is stored in `data/work.json` and served by `GET /api/work`. See README §1 + the `work.py` module doc.
+* **Work / pomodoro-goal feature is implemented and tested** (v7: rewritten `work.py`, `work.html`, `test_work.py`; wired into `app.py` and `secondary.py` via the store's block-e window, now re-synced on every `GET /api/work` too). A settable **daily goal** + work/rest **stretch** lengths; the resolver blocks every domain during work stretches and un-blocks during rests; work-time is credited to the goal (capped by real elapsed wall-clock, phase boundaries anchored to server time); goal reached → done, day ending short → logged only (fresh idle day, no penalty self-lock); v7 adds the chime-marked rhythm: rest auto-starts after a work stretch, breaks end in a WAITING state whose "break over" chime loops until resume/pause. A per-day work-data `log` is stored in `data/work.json` and served by `GET /api/work`. See README §1 + the `work.py` module doc.
 * Single-host `limiter.service` still **running** (systemd --user, lingering → auto
   at boot) on :8443/:5354/:8080. This is the *old* mode and still works, but for the
   new central/secondary topology the **central** should be run in central-only mode:

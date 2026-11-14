@@ -140,8 +140,6 @@ class Handler(BaseHTTPRequestHandler):
                 st = w.set_goal(rec.get("ms"))
             elif action == "set_interval":
                 st = w.set_interval(rec.get("work_ms"), rec.get("rest_ms"))
-            elif action == "set_penalty":
-                st = w.set_penalty(rec.get("ms"))
             elif action == "set_active_card":
                 st = w.set_active_card(rec.get("cid"))
             elif action == "start":

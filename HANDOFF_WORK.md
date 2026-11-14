@@ -1,8 +1,72 @@
-# HANDOFF PROMPT — "Control Limits" (v6 — central + secondary architecture + Work pomodoro goal, ~2026-11-13)
+# HANDOFF PROMPT — "Control Limits" (v7 — central + secondary architecture + Work pomodoro goal with chimes, ~2026-11-14)
 
 === BEGIN HANDOFF PROMPT ===
 
-## 0c. WHAT CHANGED THIS SESSION (v5 → v6): WORK TIMER IS NOW A POMODORO GOAL TIMER
+## 0d. WHAT CHANGED THIS SESSION (v6 → v7): WORK TIMER — SELF-LOCK REMOVED + CHIMES + NO AUTO-RESTART
+
+The Work timer (`work.py` / `work.html` / `test_work.py`, wired in `app.py` +
+`secondary.py`) had two user-requested changes. The v6 state machine and all
+its cheat-resistance/anchoring are otherwise UNCHANGED — read the `work.py`
+module doc (v7) for the full rules.
+
+1. **REMOVED: the "day ends short of goal" self-lock (the bug).** In v6, when
+   00:00 caught the session active with the goal unmet, the session became
+   `failed`, a penalty window (`penalty_ms`) blocked EVERYTHING, and no new
+   session could start until the next 00:00 — i.e. the timer locked *itself*.
+   The user said that was a misunderstanding: blocking (at most) the app
+   time-limits was the intent, and he doesn't even want that — so the whole
+   mechanism is GONE (v7): at 00:00 the day is only LOGGED as failed in the
+   per-day work-data log, the new day starts **IDLE**, and the timer is
+   always startable. Concretely: no `failed` session exists anymore, no
+   `penalty_until_ms` / `penalty_ms` fields, no `set_penalty` API action (the
+   route was deleted from `app.py` AND `secondary.py`), no `penalty_*` keys in
+   `GET /api/work` (also dropped: the `failed` status key). The daily `log`
+   still carries a `failed` boolean — stored work data only.
+   **Migration:** `_load` heals a legacy state file stuck in the old
+   `session == "failed"` state to `idle` (remembering it was active-via
+   `day_ended_active` so the day still logs as failed) and pops the legacy
+   penalty fields. The block window (`store.work_until`) is now ONLY: the
+   exact end of a live work stretch, or until-resume/00:00 when paused
+   *mid work stretch*; rests, waiting and a silenced-waiting pause are 0.
+2. **NEW RHYTHM + CHIMES (v7):** the break no longer auto-chains into the next
+   work stretch. `resting` now ends in a new **`waiting`** state: block off,
+   no auto-work, `session=="waiting"`, `phase=="work"`, `phase_left_ms==0`,
+   and the status exposes **`awaiting_work: true`** (also true for a pause done
+   from waiting, via the internal `wait_work` marker). `resume` from waiting
+   (or from that silence-pause) starts a FRESH work stretch anchored to the
+   server clock; `pause` while waiting silences it (paused, `awaiting_work`
+   true, block 0). The chimes live ENTIRELY in the client
+   (`work.html`, WebAudio tones — no audio files, stdlib-friendly):
+   * work done (`working -> resting`, and also `working -> success`) → the
+     page plays the "time for a break" chime (two-note A5/E6 rise);
+   * break over (`resting -> waiting`) → the page plays the "break over" chime
+     (E5-G5-B5 call) and then LOOPS it every 10 s until the session leaves
+     waiting (resume or pause); the dial shows `--:--` with a pulsing amber
+     "BREAK OVER · RINGING" box; the UI offers "Start work stretch" (resume)
+     and "Pause (silence)".
+   * The server never plays audio — it only flips states; the page polls
+     (≤1 Hz flushes while active, 5 s loads otherwise) and fires chimes on
+     state transitions, so the tab must be open (and sound unlocked on the
+     first click — the 🔊 "test chime" button exists for that). No chime if the
+     tab was closed when a transition flipped server-side. Acceptable by design
+     (single-user device).
+3. **API diff (both gates):** `POST /api/work` loses `set_penalty`; `GET
+   /api/work` loses `penalty_ms / penalty_active / penalty_left_ms / failed`
+   and gains `awaiting_work`; `session` may now be `"waiting"`.
+   Everything else (goal/intervals/cards/tick semantics, credit capping,
+   phase anchoring, boot restore of the work block window) is unchanged.
+   Env var `WORK_PALTY_MS` is DEAD (removed).
+4. **Tests:** `test_work.py` rewritten around the v7 flow (unit: waiting
+   state, resume-from-waiting, pause-while-waiting silence, day-end → fresh
+   idle start + failed log entry; integration: blocked during work, free
+   during rest, still free while WAITING, re-blocked after resume, success
+   stays free, legacy stuck `failed` state heals over HTTP with no penalty
+   block). **All 9 suites green** (ran live with the secondary gateway up —
+   the suites use :8199/:5358/:5354/:8081/:8082/:8083/:8444/:8450, so the
+   running :8080/:8443 do not collide).
+5. Docs updated: README §1/§2/file-map/env/API, this file.
+
+## 0c. WHAT CHANGED (v5 → v6): WORK TIMER IS NOW A POMODORO GOAL TIMER
 
 The **Work** feature (`work.py` / `work.html` / `test_work.py`, wired in `app.py` +
 `secondary.py`) was RECONCEPTUALIZED at the user's request. The old design (a
@@ -185,9 +249,9 @@ of the workout with the opposite effect):
 
 | File | Role | Status |
 |---|---|---|
-| `work.py` | Daily **pomodoro goal** state machine (v6): settable daily goal + work/rest stretch lengths, wall-clock-credited work-time (rest only recorded), block only during work stretches, day-end failure + penalty, per-day work-data log. Persists to `data/work.json`. | done, tested |
-| `work.html` | Page 3 — goal + stretch settings, the work/rest dial, start/pause/resume, task cards, penalty, "worked / goal" line (no fancy progress UI yet by design). | done |
-| `test_work.py` | Work feature tests: unit for the state machine + live end-to-end through the real DNS resolver (session blocks every domain, penalty window, un-block on completion). | green |
+| `work.py` | Daily **pomodoro goal** state machine (v7): settable daily goal + work/rest stretch lengths, wall-clock-credited work-time (rest only recorded), block only during work stretches, auto-rest after a work stretch, the waiting chime state (break over → waits for resume/pause), day-end short-goal logged only (NO failure/penalty self-lock), per-day work-data log. Persists to `data/work.json`. | done, tested |
+| `work.html` | Page 3 — goal + stretch settings, the work/rest dial, start/pause/resume, task cards, WebAudio **chimes** (break-start chime, break-over chime looping every 10 s, 🔊 test-chime button), "worked / goal" line (no fancy progress UI yet by design). | done |
+| `test_work.py` | Work feature tests: unit for the state machine + live end-to-end through the real DNS resolver (blocks every domain during work, un-blocks during rest, stays un-blocked while WAITING, re-blocks on resume, un-blocks on completion, legacy "failed" state heals). | green |
 
 **this handoff's prior NEW table (central/secondary, v5) is still valid and unchanged.**
 
@@ -272,9 +336,10 @@ on `127.0.0.1:5354` means the gateway is still running. `test_bypass.py` still d
 - Snap Firefox profile lives under `~/snap/firefox/common/…`. Snap has a private /tmp.
 - `_proc/net/*` hex addresses are **host-byte-order u32** on little-endian — reverse the bytes.
 - `doh.py` uses `ThreadingHTTPServer` + `ctx.wrap_socket(server_sock)`.
-- **Work block-e window (`store.work_active(now)`)** sits in `dns.resolve_bytes` RIGHT AFTER the reward check and BEFORE nuclear — it is the inverse of the workout reward: while active, EVERY domain (time-limit AND absolute) resolves to `0.0.0.0` (localhost exempt). v6: the window equals the exact wall-clock END OF THE CURRENT WORK STRETCH (0 during rests, until-resume/00:00 when paused in work, the penalty expiry when failed). Set/clear it via `set_work_until(ms)` — synced after every `GET` AND `POST /api/work`, and re-armed on boot. It is a per-device LOCAL concern on the secondary (synced onto the `RemoteStore`), like the workout — the central does not own it.
+- **Work block-e window (`store.work_active(now)`)** sits in `dns.resolve_bytes` RIGHT AFTER the reward check and BEFORE nuclear — it is the inverse of the workout reward: while active, EVERY domain (time-limit AND absolute) resolves to `0.0.0.0` (localhost exempt). v7: the window equals the exact wall-clock END OF THE CURRENT WORK STRETCH (0 during rests AND during the waiting chime state, until-resume/00:00 when paused mid work stretch, 0 for a silenced waiting pause; the old penalty-expiry case is gone). Set/clear it via `set_work_until(ms)` — synced after every `GET` AND `POST /api/work`, and re-armed on boot. It is a per-device LOCAL concern on the secondary (synced onto the `RemoteStore`), like the workout — the central does not own it.
 - **Work (v6) cheat-resistance & rhythm**: credited work/rest time is capped by real elapsed wall-clock between ticks (never trust a big client-reported delta), and the work/rest phase boundaries are anchored to the SERVER wall clock (a phase ends exactly when it should, even across client lag / gateway restart; `status()` auto-advances expired phases and `Work._advance` is the ONLY place phases flip). The daily GOAL is freely settable (NOT monotonic — that was the old minimum) but clamped to `[MIN_WORK_GOAL_MS, 8h]`.
-- **Work (v6) failure is a DAY-END event**: a session failing mid-day (old "budget ran out") no longer exists; the penalty arms only in `_maybe_reset` when 00:00 catches the session active with `accrued < goal`. The per-day record in `data/work.json["log"]` is THE stored work data the user asked for (display UI explicitly deferred).
+- **Work (v7) a missed goal NEVER locks anything**: 00:00 catching an active session short of the goal only LOGS that day as failed (in `data/work.json["log"]`) and starts a fresh IDLE day — no `failed` session, no penalty window, `start` always works (v6's self-lock was a user-reported misunderstanding and is fully removed). The per-day log record is THE stored work data the user asked for (display UI explicitly deferred).
+- **Work (v7) chimes are CLIENT-side** (`work.html`, WebAudio): the server only flips states at the chime points (`working->resting` / `working->success` = "time for a break", `resting->waiting` = "break over" + loop every 10 s until resume/pause). The `waiting` state is the server-side half; `awaiting_work` in the status drives the UI. Don't move chime synthesis server-side; don't add a new auto-chaining transition in `_advance` (waiting must wait for the user).
 - `index.html`/`secondary_index.html` are served stale until the browser refreshes.
 - Fail-closed offline is the default; `--allow-free-offline` flips it. Locks block always.
 
@@ -292,7 +357,7 @@ on `127.0.0.1:5354` means the gateway is still running. `test_bypass.py` still d
    `app.py` (GET /api/limits/<id>, POST /api/limits/<id>/domains, /limit/<id> route),
    `db.py`, `store.py`, and `index.html` (limit cards are now clickable → detail page);
    new file `limit.html`. Tested by `test_limit.py`. **All 9 suites green.**
-1. **Work / pomodoro-goal feature — RECONCEPTUALIZED (v6, this session).** `work.py` + `work.html` + `test_work.py` rewritten (see §0c at the top for the exact new rules and API). All 9 suites green. The old budget/minimum/"timer ran out" failure model is gone: there is now a settable DAILY GOAL, 50/10-style work/rest pomodoro stretches (block on during work, off during rest), only work minutes credited, a per-day stored work-data log, and a penalty armed only when a day ENDS (00:00) short of the goal. If the user asks for the progress display next, the data is already in `GET /api/work` → `log`.
+1. **Work / pomodoro-goal feature — v7 (this session; v6 reconcept before it).** `work.py` + `work.html` + `test_work.py` rewritten twice (see §0d for v7 — the current rules/API — and §0c for the v6 history). All 9 suites green. There is now a settable DAILY GOAL, 50/10-style work/rest pomodoro stretches (block on during work, off during rest), only work minutes credited, a per-day stored work-data log, and chimes: rest auto-starts when a work stretch is done, and a break ends in the WAITING state whose chime loops until the user resumes (fresh work stretch) or pauses (silence). A day ending (00:00) short of the goal is logged only — the timer is never locked (the v6 penalty self-lock is REMOVED; do not resurrect it). If the user asks for the progress display next, the data is already in `GET /api/work` → `log`.
 2. **Live end-to-end proof on real hardware.** Everything is proven in-process
    (test_secondary drives real DoH wire queries through the secondary). The one thing
    left is a real Firefox on a second device pointed at a secondary (steps in §5). If a

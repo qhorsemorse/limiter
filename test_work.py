@@ -1,16 +1,20 @@
 """Work / focus-session feature tests (unit + live integration) — pomodoro goal.
 
-Covers the v6 concept:
+Covers the v7 concept:
   * the Work state machine (work.py): settable DAILY GOAL + work/rest pomodoro
     stretches; only work-stretch time credits the goal; the resolver's block
     window is ON during work stretches and OFF during rests; success on
-    reaching the goal; failure + penalty when a day ends with the goal unmet;
-    cheat-resistance (client-posted deltas capped by real elapsed time); and
-    the persisted per-day work-data log.
+    reaching the goal; a break ending in the WAITING state (the next work
+    stretch does NOT auto-start — only resume/pause act on it); a day ending
+    with the goal unmet is LOGGED and the new day starts IDLE (no failure
+    state, no penalty, no self-lock of the timer); cheat-resistance
+    (client-posted deltas capped by real elapsed time); and the persisted
+    per-day work-data log.
   * integration against a live single-host app.py: a normally-FREE domain is
-    blocked during a work stretch, un-blocked during the rest stretch, blocked
-    again for the next work stretch, and stays un-blocked after success. The
-    day-end failure arms a penalty that blocks everything until it expires.
+    blocked during a work stretch, un-blocked during the rest stretch, stays
+    un-blocked while the timer waits for the user, is blocked again once work
+    is resumed, and stays un-blocked after success. A legacy stuck "failed"
+    state heals to idle (start works, nothing blocked by a penalty).
 
 Run with the gateway stopped so :5354 / :8080 are free (see README §8).
 """
@@ -25,7 +29,6 @@ os.environ["WORK_GOAL_MS"] = "3000"        # default goal 3 s
 os.environ["WORK_INTERVAL_MS"] = "2000"    # default work stretch 2 s
 os.environ["WORK_REST_MS"] = "1000"        # default rest stretch 1 s
 os.environ["MIN_WORK_INTERVAL_MS"] = "100"
-os.environ["WORK_PALTY_MS"] = "2000"       # 2 s penalty
 import work as WK
 import dns as DNS
 
@@ -94,12 +97,17 @@ def unit_tests():
     check("rest minutes accumulate (but don't credit the goal) while the goal is frozen",
           s["rested_ms"] >= 400 and s["accrued_ms"] == a_work)
 
-    # rest stretch (1.5 s) ends -> working again, block re-armed
+    # rest stretch (1.5 s) ends -> WAITING: the work stretch does NOT auto-start
     _t = 0
-    while s["session"] != "working" and _t < 20:
+    while s["session"] != "waiting" and _t < 20:
         time.sleep(0.2); _t += 0.2
         s, err = w.tick(10_000_000)
-    check("rest stretch ends -> next work stretch", s["session"] == "working" and s["cycles"] >= 1)
+    check("rest stretch ends -> WAITING (no auto work restart)",
+          s["session"] == "waiting" and s["awaiting_work"] is True and s["work_until_ms"] == 0)
+    # resume -> fresh work stretch, block re-armed
+    s = w.resume()
+    check("resume from waiting starts a work stretch",
+          s["session"] == "working" and s["cycles"] >= 1 and s["awaiting_work"] is False)
     check("block re-armed for the new work stretch", s["work_until_ms"] > NOW())
 
     # goal (4 s) reached during the 2nd work stretch -> SUCCESS, log written
@@ -146,9 +154,33 @@ def unit_tests():
     s = w.pause()
     check("pause mid rest stretch keeps the block OFF", s["session"] == "paused" and s["work_until_ms"] == 0)
     s = w.resume(); time.sleep(0.2); s, _e = w.tick(10_000_000)
-    check("resume from rest", s["session"] in ("resting", "working"))
+    check("resume from rest", s["session"] in ("resting", "working", "waiting"))
 
-    # ---- day-end failure + penalty (simulate 00:00 by moving the date back) ----
+    # ---- waiting -> pause (silence) -> resume (work starts) ----
+    rm_workfile()
+    w = WK.Work(WORK_FILE)
+    w.set_interval(work_ms=500, rest_ms=400)
+    w.set_goal(3600_000)
+    w.start()
+    _t = 0
+    while w.status()["session"] != "waiting" and _t < 40:
+        time.sleep(0.15); _t += 0.15
+        w.tick(10_000_000)
+    check("cycle reaches WAITING after the rest", w.status()["session"] == "waiting")
+    s = w.pause()
+    check("pause while waiting -> silenced pause, block OFF, awaiting_work",
+          s["session"] == "paused" and s["work_until_ms"] == 0 and s["awaiting_work"] is True)
+    time.sleep(0.3)
+    s = w.resume()
+    check("resume from silenced waiting starts a work stretch",
+          s["session"] == "working" and s["work_until_ms"] > NOW() and s["awaiting_work"] is False)
+    s = w.pause()
+    check("pause mid work stretch KEEPS the block (wait marker cleared)",
+          s["session"] == "paused" and s["awaiting_work"] is False and s["work_until_ms"] > NOW())
+    s = w.resume()
+    check("normal resume back to work", s["session"] == "working")
+
+    # ---- day end short of the goal: LOGGED, fresh IDLE day, timer NEVER locked ----
     rm_workfile()
     w = WK.Work(WORK_FILE)
     w.add_card("T", "task"); w.set_goal(4000); w.set_interval(work_ms=3000, rest_ms=0)
@@ -156,17 +188,14 @@ def unit_tests():
     w.state["date"] = "1999-01-01"          # pretend midnight passed mid-session
     w._save()
     s = w.status()
-    check("day ends short of the goal -> FAILURE", s["session"] == "failed" and s["failed"])
-    check("failure arms the penalty block", s["penalty_active"] and s["work_until_ms"] > NOW())
-    check("failed day logged in the work-data log", any(
+    check("day ends short of the goal -> fresh IDLE day (no self-lock)",
+          s["session"] == "idle" and s["work_until_ms"] == 0)
+    check("short day logged in the work-data log (failed = stored data only)", any(
         e["date"] == "1999-01-01" and e["failed"] and not e["done"] and 0 < e["worked_ms"] < 4000
         for e in s["log"]))
     s = w.start()
-    check("start rejected while failed", s["session"] == "failed")
-    time.sleep(2.3)
-    s = w.status()
-    check("penalty expires", not s["penalty_active"] and s["work_until_ms"] == 0)
-    check("day stays closed after the penalty (renews at 00:00)", s["session"] == "failed")
+    check("start works IMMEDIATELY after a short day (no penalty, no lock)",
+          s["session"] == "working" and s["work_until_ms"] > NOW())
 
     rm_workfile()
     return ok
@@ -270,7 +299,6 @@ def integration_tests():
     env["WORK_REST_MS"] = "1000"        # 1 s rest stretches
     env["MIN_WORK_GOAL_MS"] = "500"
     env["MIN_WORK_INTERVAL_MS"] = "100"
-    env["WORK_PALTY_MS"] = "2000"       # 2 s penalty
     env["WORK_FILE"] = WORK_FILE
 
     # stub = upstream (5354): answers 9.9.9.9 for any A query.
@@ -319,11 +347,19 @@ def integration_tests():
         time.sleep(0.3)
         check("free.ua UN-BLOCKED during the rest stretch (9.9.9.9)", dns_query("free.ua") == "9.9.9.9")
 
-        # the 1 s rest ends -> next WORK stretch: block ON again
+        # the 1 s rest ends -> WAITING: block stays OFF, NO auto work stretch
         _t = 0
-        while s.get("session") != "working" and _t < 30:
+        while s.get("session") != "waiting" and _t < 30:
             time.sleep(0.25); _t += 0.25
             s = http("POST", "/api/work", {"action": "tick", "delta_ms": 10_000_000})[1]
+        check("rest stretch ends -> WAITING over HTTP (no auto work)",
+              s.get("session") == "waiting" and s.get("awaiting_work") is True)
+        time.sleep(0.3)
+        check("free.ua stays UN-BLOCKED while waiting (9.9.9.9)", dns_query("free.ua") == "9.9.9.9")
+        # resume -> next WORK stretch: block ON again
+        s = http("POST", "/api/work", {"action": "resume"})[1]
+        check("resume from WAITING starts a work stretch",
+              s.get("session") == "working" and s.get("work_until_ms") > NOW())
         time.sleep(0.2)
         check("next work stretch re-blocks free.ua (0.0.0.0)", dns_query("free.ua") == "0.0.0.0")
 
@@ -342,30 +378,30 @@ def integration_tests():
     finally:
         stop_app(proc)
 
-    # ---- day-end failure -> penalty window (re-start the app over a crafted
-    # state whose date is in the past: the first status() finalizes the day) ----
+    # ---- legacy stuck state: the old v6 "failed" self-lock heals to idle
+    # (re-start the app over a crafted state whose date is in the past AND
+    # whose session is the old "failed" one: the first load/status heals day +
+    # session; the day is still kept in the log as failed data) ----
     with open(WORK_FILE, "w") as f:
-        json.dump({"date": "1999-01-01", "session": "working", "phase": "work",
+        json.dump({"date": "1999-01-01", "session": "failed", "phase": "work",
                    "phase_end_ms": NOW() + 30000, "accrued_ms": 500.0, "rested_ms": 0.0,
                    "cycles": 0, "goal_ms": 2000, "work_ms": 1500, "rest_ms": 1000,
-                   "penalty_ms": 2000, "cards": [], "active_card_id": None, "log": []}, f)
+                   "penalty_until_ms": NOW() + 3_600_000, "penalty_ms": 2000,
+                   "cards": [], "active_card_id": None, "log": []}, f)
     proc = start_app(env)
     try:
         s = http("GET", "/api/work")[1]
-        check("day ending short of the goal -> failed + penalty via HTTP",
-              s.get("session") == "failed" and s.get("penalty_active"))
-        check("worked day kept in the log as failed", any(
+        check("legacy 'failed' self-lock state heals to IDLE via HTTP",
+              s.get("session") == "idle" and s.get("awaiting_work") is False)
+        check("worked day kept in the log as failed (stored data only)", any(
             e["date"] == "1999-01-01" and e["failed"] and not e["done"] for e in s.get("log", [])))
         time.sleep(0.3)
-        check("penalty window BLOCKS free.ua (0.0.0.0)", dns_query("free.ua") == "0.0.0.0")
-        _t = 0
-        while _t < 30:
-            s = http("GET", "/api/work")[1]
-            if not s.get("penalty_active"): break
-            time.sleep(0.25); _t += 0.25
-        check("penalty clears after its window", not s.get("penalty_active"))
+        check("no penalty: free.ua still FORWARDS (9.9.9.9)", dns_query("free.ua") == "9.9.9.9")
+        s = http("POST", "/api/work", {"action": "start"})[1]
+        check("timer starts right away after a failed day (never locked)",
+              s.get("session") == "working" and s.get("work_until_ms") > NOW())
         time.sleep(0.3)
-        check("free.ua FORWARDS again after the penalty expires", dns_query("free.ua") == "9.9.9.9")
+        check("work stretch blocks as usual (0.0.0.0)", dns_query("free.ua") == "0.0.0.0")
     finally:
         stop_app(proc)
         rm(WORK_DB); rm_workfile()
